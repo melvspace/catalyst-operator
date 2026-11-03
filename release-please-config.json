@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "rust",
+      "include-component-in-tag": false,
+      "bump-minor-pre-major": true,
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "charts/catalyst-operator/Chart.yaml"
+        },
+        {
+          "type": "generic",
+          "path": "charts/catalyst-operator/values.yaml"
+        }
+      ]
+    }
+  }
+}

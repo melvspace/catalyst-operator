@@ -1,6 +1,6 @@
 image:
-  repository: ghcr.io/catalystctl/catalyst-operator
-  tag: "0.1.0"
+  repository: ghcr.io/melvspace/catalyst-operator
+  tag: "0.1.0" # x-release-please-version
   pullPolicy: IfNotPresent
 catalyst:
   # API base URL must include /api. Configure a reachable Catalyst installation.
