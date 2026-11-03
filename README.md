@@ -15,7 +15,7 @@ docker build -t YOUR_REGISTRY/catalyst-operator:0.1.0 .
 docker push YOUR_REGISTRY/catalyst-operator:0.1.0
 ```
 
-Create a `catalyst-api` Secret in the operator namespace containing an `api-key` entry. Supply your credential through your existing Secret management tooling. The API credential needs permission to read/manage templates and nests, create/update/delete servers, and install/start/stop servers. Setting another owner additionally requires Catalyst's `user.create` permission.
+Create a `catalyst-api` Secret in the operator namespace containing an `api-key` entry. Supply your credential through your existing Secret management tooling. The API credential needs permission to read/manage templates and nests, create/update/delete servers, and install/start/stop servers. Selecting an allocation also requires `node.read` access to its node. Setting another owner additionally requires Catalyst's `user.create` permission.
 
 Install one operator release per cluster. It watches all namespaces and assumes trusted administrators. Configure `catalyst.url` with the complete API base, including `/api`:
 
@@ -115,7 +115,7 @@ Imported templates retain a canonical ConfigMap snapshot and source digest. Each
 
 ## Networking
 
-The initial implementation uses Catalyst bridge networking. `primaryPort` is explicit; optional `portBindings` maps container port strings to host ports. The primary port receives an identity mapping unless explicitly mapped. `primaryIp` and `allocationId` are mutually exclusive. When using an existing Catalyst allocation, its port must match `primaryPort`.
+The initial implementation uses Catalyst bridge networking. `primaryPort` is explicit; optional `portBindings` maps container port strings to host ports. The primary port receives an identity mapping unless explicitly mapped. To bind a specific address, select an existing Catalyst `allocationId` whose port matches `primaryPort`; `primaryIp` is unsupported for bridge networking and is rejected. Change the allocation and primary port together to switch allocations. Removing an assigned allocation is unsupported by Catalyst's server-update API: restore the reference, select a different allocation, or migrate to a separate Server without an allocation.
 
 Server status exposes TCP/UDP endpoints using the bound address or Catalyst node address and published host ports. An in-cluster proxy connects to those addresses. Your routing and node firewall must permit that path. The operator does not create Services, tunnels, proxy configuration, or game health checks.
 
@@ -125,7 +125,7 @@ Kubernetes owns declared fields. Conflicting Catalyst changes are reconciled bac
 
 Creation, installation, and power requests are separate operations. Intent is persisted before non-idempotent calls, with resource-version checks and Lease leadership limiting concurrent writers. After an ambiguous create response, the operator searches for its Kubernetes UID marker. It never retries creation without a uniquely recoverable result. Preserve those description markers.
 
-Runtime changes update Catalyst configuration but leave a running process untouched. Change `spec.restartToken` to request a stop/start cycle. `powerState: Stopped` keeps the server stopped; stopping a `Running` server through Catalyst alone is temporary.
+Environment and startup changes update Catalyst configuration but leave a running process untouched. Quota and port changes wait for the server to stop. Change `spec.restartToken` to authorize the stop/update/start cycle, or request `powerState: Stopped` to stop and apply the configuration without starting it. Pending changes report `RestartRequired`. Stopping a `Running` server through Catalyst alone is temporary.
 
 Starts use bounded retries with backoff. Five minutes of stable running resets the failure budget. Once `RecoveryRequired` appears, resolve the failure and change `spec.retryToken`. The default budget is five attempts.
 

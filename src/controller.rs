@@ -547,11 +547,17 @@ fn marked<K: Managed>(description: &str, object: &K, suffix: &str) -> String {
 pub fn differs(actual: &Value, desired: &Value) -> bool {
     desired.as_object().unwrap().iter().any(
         |(key, value)| {
-            let actual = actual.get(key).unwrap_or(&Value::Null);
-
-            !(actual == value || (actual.is_null() && value == ""))
+            field_differs(
+                actual, key, value,
+            )
         },
     )
+}
+
+fn field_differs(actual: &Value, key: &str, desired: &Value) -> bool {
+    let actual = actual.get(key).unwrap_or(&Value::Null);
+
+    !(actual == desired || (actual.is_null() && desired == ""))
 }
 
 async fn create<K: Managed>(

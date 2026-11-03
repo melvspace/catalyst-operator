@@ -34,7 +34,7 @@ fn template_fields(value: &Value) -> Value {
     result
 }
 
-fn immutable(spec: &ServerSpec) -> String {
+pub(super) fn immutable(spec: &ServerSpec) -> String {
     digest(
         &(
             &spec.template_ref.name,
@@ -234,21 +234,82 @@ async fn environment(
     Ok(result)
 }
 
+async fn selected_allocation(
+    context: &Context,
+    spec: &ServerSpec,
+) -> Result<Option<Value>, Error> {
+    let Some(id) = &spec.allocation_id else {
+        return Ok(None);
+    };
+    let allocation = context
+        .catalyst
+        .allocation(
+            &spec.node_id,
+            id,
+        )
+        .await?
+        .ok_or_else(
+            || {
+                blocked(
+                    "InvalidNetwork",
+                    "The selected allocation does not exist on the declared node",
+                )
+            },
+        )?;
+
+    if allocation["port"] != spec.primary_port {
+        return Err(
+            blocked(
+                "InvalidNetwork",
+                "primaryPort must match the selected Catalyst allocation's port",
+            ),
+        );
+    }
+
+    if !allocation["serverId"].is_null() && !allocation["serverId"].is_string()
+    {
+        return Err(
+            blocked(
+                "InvalidResponse",
+                "Catalyst allocation has an invalid serverId",
+            ),
+        );
+    }
+
+    Ok(Some(allocation))
+}
+
 pub(super) async fn server<K: Managed>(
     object: &mut K,
     status: &mut ResourceStatus,
     context: &Context,
     spec: &ServerSpec,
 ) -> Result<Action, Error> {
-    if spec.primary_ip.is_some() && spec.allocation_id.is_some() {
+    if spec.primary_ip.is_some() {
         return Err(
             blocked(
                 "InvalidNetwork",
-                "primaryIp and allocationId are mutually exclusive",
+                "Bridge networking does not support primaryIp. Remove it and select an allocationId to bind an address.",
             ),
         );
     }
 
+    if status.external_id.is_some()
+        && status.allocation_id.is_some()
+        && spec.allocation_id.is_none()
+    {
+        return Err(
+            blocked(
+                "AllocationRemovalUnsupported",
+                "Catalyst cannot release an allocation through server updates. Restore spec.allocationId, select another allocation, or migrate to a separate Server without an allocation.",
+            ),
+        );
+    }
+
+    let mut allocation = selected_allocation(
+        context, spec,
+    )
+    .await?;
     let snapshot = server_snapshot(
         object, status, context, spec,
     )
@@ -432,10 +493,6 @@ pub(super) async fn server<K: Managed>(
         "startupCommand": startup,
     });
 
-    if let Some(ip) = &spec.primary_ip {
-        body["primaryIp"] = json!(ip);
-    }
-
     if let Some(allocation) = &spec.allocation_id {
         body["allocationId"] = json!(allocation);
     }
@@ -476,6 +533,10 @@ pub(super) async fn server<K: Managed>(
             object, status, context,
         )
         .await?;
+        allocation = selected_allocation(
+            context, spec,
+        )
+        .await?;
     }
 
     let id = status.external_id.clone().unwrap();
@@ -491,6 +552,7 @@ pub(super) async fn server<K: Managed>(
             status.installed = false;
             status.operation = None;
             status.running_digest = None;
+            status.running_since = None;
             status.recovery_attempts = 0;
             save(
                 object, status, context,
@@ -516,6 +578,9 @@ pub(super) async fn server<K: Managed>(
         .unwrap_or("unknown");
     status.external_state = Some(state.into());
     status.endpoints = endpoints(&actual);
+    observe_running(
+        status, state,
+    );
 
     if actual["templateId"] != runtime_id
         || actual["nodeId"] != spec.node_id
@@ -529,18 +594,23 @@ pub(super) async fn server<K: Managed>(
         );
     }
 
-    if spec.allocation_id.is_some()
-        && actual["primaryPort"] != spec.primary_port
-    {
-        return Err(
-            blocked(
-                "InvalidNetwork",
-                "primaryPort must match the chosen Catalyst allocation's port",
-            ),
-        );
-    }
+    let allocation_changed = if let Some(allocation) = &allocation {
+        if allocation["serverId"]
+            .as_str()
+            .is_some_and(|owner| owner != id)
+        {
+            return Err(
+                blocked(
+                    "AllocationConflict",
+                    "The selected Catalyst allocation belongs to another server",
+                ),
+            );
+        }
 
-    let allocation_changed = status.allocation_id != spec.allocation_id;
+        allocation["serverId"] != id
+    } else {
+        false
+    };
 
     if !allocation_changed {
         body.as_object_mut()
@@ -570,18 +640,121 @@ pub(super) async fn server<K: Managed>(
         }
     }
 
-    if differs(
-        &actual_comparable,
-        &comparable,
-    ) || allocation_changed
+    let mut updates = comparable.clone();
+    updates.as_object_mut().unwrap().retain(
+        |key, value| {
+            field_differs(
+                &actual_comparable,
+                key,
+                value,
+            )
+        },
+    );
+
+    if allocation_changed {
+        updates["allocationId"] = json!(spec.allocation_id);
+    }
+
+    if updates.get("name").is_some()
+        && context
+            .catalyst
+            .list("servers")
+            .await?
+            .iter()
+            .any(|server| server["id"] != id && server["name"] == body["name"])
     {
+        return Err(
+            blocked(
+                "NameConflict",
+                "Another Catalyst server already uses the requested name; choose another spec.name",
+            ),
+        );
+    }
+
+    if status.installed
+        && let Some(action) = power_transition(
+            object, status, context, state,
+        )?
+    {
+        return Ok(action);
+    }
+
+    let requires_stopped = [
+        "allocatedMemoryMb",
+        "allocatedCpuCores",
+        "allocatedDiskMb",
+        "primaryPort",
+        "portBindings",
+        "allocationId",
+    ]
+    .iter()
+    .any(|field| updates.get(*field).is_some());
+
+    if requires_stopped && state != "stopped" {
+        if !status.installed {
+            return install(
+                object, status, context, spec, &id, state,
+            )
+            .await;
+        }
+
+        if state == "running"
+            && spec.power_state == PowerState::Running
+            && status.restart_token == spec.restart_token
+        {
+            condition(
+                object,
+                status,
+                false,
+                "RestartRequired",
+                "Resource or network changes require a stopped server. Change spec.restartToken or request powerState: Stopped to apply them.",
+                true,
+            );
+
+            return Ok(Action::requeue(context.poll));
+        }
+
+        let mut stopping_spec = spec.clone();
+        stopping_spec.power_state = PowerState::Stopped;
+        let applied_digest = status
+            .configuration_digest
+            .clone()
+            .unwrap_or_default();
+
+        return power(
+            object,
+            status,
+            context,
+            &stopping_spec,
+            &id,
+            state,
+            &applied_digest,
+        )
+        .await;
+    }
+
+    if updates.get("environment").is_some() {
+        let mut updated_environment = actual["environment"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+
+        for key in &status.managed_environment_keys {
+            updated_environment.remove(key);
+        }
+
+        updated_environment.extend(env.as_object().unwrap().clone());
+        updates["environment"] = Value::Object(updated_environment);
+    }
+
+    if !updates.as_object().unwrap().is_empty() {
         ensure_leader(context)?;
         context
             .catalyst
             .request(
                 Method::PUT,
                 &format!("servers/{id}"),
-                Some(&body),
+                Some(&updates),
             )
             .await?;
     }
@@ -806,15 +979,38 @@ pub(super) async fn install<K: Managed>(
     Ok(Action::requeue(Duration::from_secs(1)))
 }
 
-pub(super) async fn power<K: Managed>(
+fn observe_running(status: &mut ResourceStatus, state: &str) {
+    if state != "running" {
+        status.running_since = None;
+
+        return;
+    }
+
+    let since = status
+        .running_since
+        .get_or_insert_with(|| Utc::now().to_rfc3339());
+
+    if chrono::DateTime::parse_from_rfc3339(since)
+        .ok()
+        .is_some_and(
+            |since| {
+                Utc::now()
+                    .signed_duration_since(since)
+                    .num_seconds()
+                    >= 300
+            },
+        )
+    {
+        status.recovery_attempts = 0;
+    }
+}
+
+fn power_transition<K: Managed>(
     object: &mut K,
     status: &mut ResourceStatus,
     context: &Context,
-    spec: &ServerSpec,
-    id: &str,
     state: &str,
-    desired_digest: &str,
-) -> Result<Action, Error> {
+) -> Result<Option<Action>, Error> {
     if let Some(op) = status.operation.clone() {
         let reached = match op.kind.as_str() {
             "Start" => state == "running",
@@ -857,14 +1053,38 @@ pub(super) async fn power<K: Managed>(
                 false,
             );
 
-            return Ok(Action::requeue(Duration::from_secs(2)));
+            return Ok(Some(Action::requeue(Duration::from_secs(2))));
         }
+    }
+
+    Ok(None)
+}
+
+pub(super) async fn power<K: Managed>(
+    object: &mut K,
+    status: &mut ResourceStatus,
+    context: &Context,
+    spec: &ServerSpec,
+    id: &str,
+    state: &str,
+    desired_digest: &str,
+) -> Result<Action, Error> {
+    observe_running(
+        status, state,
+    );
+
+    if let Some(action) = power_transition(
+        object, status, context, state,
+    )? {
+        return Ok(action);
     }
 
     let wants_running = spec.power_state == PowerState::Running;
     let restart_requested = status.restart_token != spec.restart_token;
 
-    if state == "running" && (!wants_running || restart_requested) {
+    if ["running", "starting", "crashed", "error"].contains(&state)
+        && (!wants_running || restart_requested)
+    {
         return power_request(
             object,
             status,
@@ -918,22 +1138,6 @@ pub(super) async fn power<K: Managed>(
     }
 
     if wants_running && state == "running" {
-        if status
-            .last_power_attempt_at
-            .as_deref()
-            .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
-            .is_some_and(
-                |v| {
-                    Utc::now()
-                        .signed_duration_since(v)
-                        .num_seconds()
-                        >= 300
-                },
-            )
-        {
-            status.recovery_attempts = 0;
-        }
-
         if status.running_digest.as_deref() != Some(desired_digest) {
             condition(
                 object,
@@ -1011,6 +1215,7 @@ async fn power_request<K: Managed>(
     status.operation_configuration_digest = Some(desired_digest.into());
     status.operation_restart_token = Some(spec.restart_token.clone());
     status.last_power_attempt_at = Some(Utc::now().to_rfc3339());
+    status.running_since = None;
 
     if endpoint == "start" {
         status.recovery_attempts += 1;

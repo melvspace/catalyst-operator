@@ -207,6 +207,46 @@ impl Catalyst {
 
         Ok(all)
     }
+
+    pub async fn allocation(
+        &self,
+        node_id: &str,
+        allocation_id: &str,
+    ) -> Result<Option<Value>, ApiError> {
+        let collection = format!("nodes/{node_id}/allocations");
+        let mut page = 1;
+
+        loop {
+            let response = self
+                .request(
+                    Method::GET,
+                    &format!("{collection}?limit=100&page={page}"),
+                    None,
+                )
+                .await?;
+            let rows = response["data"].as_array().ok_or_else(
+                || {
+                    invalid_response(
+                        &collection,
+                        "Allocation response is missing its data array",
+                    )
+                },
+            )?;
+
+            if let Some(allocation) = rows
+                .iter()
+                .find(|value| value["id"] == allocation_id)
+            {
+                return Ok(Some(allocation.clone()));
+            }
+
+            if rows.len() < 100 {
+                return Ok(None);
+            }
+
+            page += 1;
+        }
+    }
 }
 
 fn invalid_response(path: &str, guidance: &str) -> ApiError {

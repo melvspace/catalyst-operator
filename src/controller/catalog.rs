@@ -68,7 +68,18 @@ pub(super) async fn template_body<K: Managed>(
         &spec.native,
         &spec.egg,
     ) {
-        (Some(native), None) => serde_json::to_value(native).unwrap(),
+        (Some(native), None) => {
+            let mut body = serde_json::to_value(native).unwrap();
+            body["installEntrypoint"] = json!(
+                native
+                    .install_entrypoint
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("bash")
+            );
+
+            body
+        }
         (None, Some(source)) => match (
             &source.url,
             &source.config_map_key_ref,
@@ -193,6 +204,13 @@ pub(super) async fn template_body<K: Managed>(
     Ok(body)
 }
 
+pub(super) fn egg_http_client() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(3))
+}
+
 async fn fetch_egg(url: &str) -> Result<Vec<u8>, Error> {
     let parsed = reqwest::Url::parse(url).map_err(
         |_| {
@@ -215,18 +233,14 @@ async fn fetch_egg(url: &str) -> Result<Vec<u8>, Error> {
         );
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(3))
-        .build()
-        .map_err(
-            |_| {
-                blocked(
-                    "SourceUnavailable",
-                    "Could not initialize egg HTTP client",
-                )
-            },
-        )?;
+    let client = egg_http_client().build().map_err(
+        |_| {
+            blocked(
+                "SourceUnavailable",
+                "Could not initialize egg HTTP client",
+            )
+        },
+    )?;
     let response = client
         .get(parsed)
         .send()

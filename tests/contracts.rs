@@ -111,6 +111,61 @@ fn generated_resources_are_namespaced_with_status_subresources() {
 }
 
 #[tokio::test]
+async fn allocation_lookup_uses_page_pagination() {
+    use wiremock::matchers::query_param;
+
+    let server = MockServer::start().await;
+    let rows: Vec<_> = (0..100)
+        .map(|index| json!({"id": index.to_string(), "port": 25565, "serverId": null}))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/nodes/node/allocations"))
+        .and(
+            query_param(
+                "page", "1",
+            ),
+        )
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": rows})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/nodes/node/allocations"))
+        .and(
+            query_param(
+                "page", "2",
+            ),
+        )
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"data": [
+                    {"id": "selected", "port": 25566, "serverId": null}
+                ]}),
+            ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = Catalyst::new(
+        &server.uri(),
+        "test".into(),
+    )
+    .unwrap();
+    let allocation = client
+        .allocation(
+            "node", "selected",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        allocation["port"],
+        25566
+    );
+}
+
+#[tokio::test]
 async fn api_errors_never_echo_secret_values() {
     let server = MockServer::start().await;
     Mock::given(method("PUT")).and(path("/api/servers/id"))

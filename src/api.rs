@@ -247,6 +247,7 @@ pub struct ResourceStatus {
     pub operation_configuration_digest: Option<String>,
     pub operation_restart_token: Option<String>,
     pub last_power_attempt_at: Option<String>,
+    pub running_since: Option<String>,
     #[serde(default)]
     pub managed_environment_keys: Vec<String>,
     pub running_digest: Option<String>,
@@ -358,7 +359,7 @@ pub fn crds()
                     {"rule": "self.locationId == oldSelf.locationId", "message": "locationId is immutable"},
                     {"rule": "self.templateRef == oldSelf.templateRef", "message": "templateRef is immutable"},
                     {"rule": "has(self.ownerId) == has(oldSelf.ownerId) && (!has(self.ownerId) || self.ownerId == oldSelf.ownerId)", "message": "ownerId is immutable"},
-                    {"rule": "!(has(self.primaryIp) && has(self.allocationId))", "message": "primaryIp and allocationId are mutually exclusive"}
+                    {"rule": "!has(self.primaryIp)", "message": "Bridge networking does not support primaryIp; select an allocationId to bind an address"}
                 ]);
                 spec["properties"]["environment"]["additionalProperties"]["x-kubernetes-validations"] = serde_json::json!([{
                     "rule": "has(self.value) != has(self.secretKeyRef)",

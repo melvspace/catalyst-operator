@@ -195,6 +195,9 @@ spec:
               runningDigest:
                 nullable: true
                 type: string
+              runningSince:
+                nullable: true
+                type: string
               runtimeTemplateId:
                 nullable: true
                 type: string
@@ -520,6 +523,9 @@ spec:
               runningDigest:
                 nullable: true
                 type: string
+              runningSince:
+                nullable: true
+                type: string
               runtimeTemplateId:
                 nullable: true
                 type: string
@@ -706,8 +712,8 @@ spec:
               rule: self.templateRef == oldSelf.templateRef
             - message: ownerId is immutable
               rule: has(self.ownerId) == has(oldSelf.ownerId) && (!has(self.ownerId) || self.ownerId == oldSelf.ownerId)
-            - message: primaryIp and allocationId are mutually exclusive
-              rule: '!(has(self.primaryIp) && has(self.allocationId))'
+            - message: Bridge networking does not support primaryIp; select an allocationId to bind an address
+              rule: '!has(self.primaryIp)'
           status:
             nullable: true
             properties:
@@ -854,6 +860,9 @@ spec:
                 default: ''
                 type: string
               runningDigest:
+                nullable: true
+                type: string
+              runningSince:
                 nullable: true
                 type: string
               runtimeTemplateId:
