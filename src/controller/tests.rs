@@ -34,6 +34,16 @@ impl Respond for NameCatalog {
         let mut rows = self.0.lock().unwrap();
 
         if request.method == "GET" {
+            if let Some(id) = request
+                .url
+                .path()
+                .strip_prefix("/servers/")
+            {
+                return ResponseTemplate::new(200).set_body_json(
+                    json!({"data": rows.iter().find(|row| row["id"] == id)}),
+                );
+            }
+
             // Capture the catalog before delaying, exposing overlapping checks.
             return ResponseTemplate::new(200)
                 .set_body_json(json!({"data": rows.clone()}))
@@ -97,6 +107,351 @@ fn one_name_claim<T, U>(left: Result<T, Error>, right: Result<U, Error>) {
     );
 }
 
+fn restarted(context: &Context) -> Context {
+    Context {
+        client: context.client.clone(),
+        catalyst: context.catalyst.clone(),
+        poll: context.poll,
+        leader: context.leader.clone(),
+        max_recovery: context.max_recovery,
+        operation_timeout: context.operation_timeout,
+        server_names: tokio::sync::Mutex::new(()),
+    }
+}
+
+async fn delayed_name_claim(first_rename: bool, second_rename: bool) {
+    let (kube, catalyst, context, mut first, stored) =
+        fixture_for(server_object()).await;
+    let (mut second, _) = peer_server(
+        &kube,
+        &first,
+        stored.clone(),
+    )
+    .await;
+    let mut rows = Vec::new();
+
+    if first_rename {
+        rows.push(json!({"id": "first", "name": "before-first"}));
+    }
+
+    if second_rename {
+        rows.push(json!({"id": "second", "name": "before-second"}));
+    }
+
+    let catalog = name_catalog(
+        &catalyst, rows,
+    )
+    .await;
+    Mock::given(method(if first_rename { "PUT" } else { "POST" }))
+        .and(
+            path(
+                if first_rename {
+                    "/servers/first"
+                } else {
+                    "/servers"
+                },
+            ),
+        )
+        .respond_with(
+            ResponseTemplate::new(504)
+                .set_body_json(json!({"code": "GATEWAY_TIMEOUT"})),
+        )
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&catalyst)
+        .await;
+    let body = json!({"name": "claimed", "description": marker(&first, "")});
+    let updates = json!({"name": "claimed"});
+    let mut first_status = ResourceStatus::default();
+    let result = if first_rename {
+        super::server::update_server(
+            &mut first,
+            &mut first_status,
+            &context,
+            "first",
+            &updates,
+        )
+        .await
+    } else {
+        create(
+            &mut first,
+            &mut first_status,
+            &context,
+            "servers",
+            &body,
+            false,
+        )
+        .await
+        .map(|_| ())
+    };
+    assert!(result.is_err());
+    assert!(first_status.name_operation.is_some());
+
+    // Lose in-memory state and the mutex while the backend has not yet committed.
+    let context = restarted(&context);
+    let mut first: Server =
+        serde_json::from_value(stored.lock().unwrap().clone()).unwrap();
+    let mut first_status = first.status();
+    let mut second_status = ResourceStatus::default();
+    let second_body =
+        json!({"name": "claimed", "description": marker(&second, "")});
+    let result = if second_rename {
+        super::server::update_server(
+            &mut second,
+            &mut second_status,
+            &context,
+            "second",
+            &updates,
+        )
+        .await
+    } else {
+        create(
+            &mut second,
+            &mut second_status,
+            &context,
+            "servers",
+            &second_body,
+            false,
+        )
+        .await
+        .map(|_| ())
+    };
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("NameConflict")
+    );
+    assert!(
+        cleanup(
+            &mut first,
+            &mut first_status,
+            &context
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        first
+            .finalizers()
+            .iter()
+            .any(|value| value == FINALIZER)
+    );
+
+    // The original backend request commits after the conflicting CR was blocked.
+    if first_rename {
+        catalog
+            .0
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["id"] == "first")
+            .unwrap()["name"] = json!("claimed");
+        names::recover_rename(
+            &mut first,
+            &mut first_status,
+            &context,
+        )
+        .await
+        .unwrap();
+    } else {
+        let mut committed = body.clone();
+        committed["id"] = json!("late-first");
+        catalog
+            .0
+            .lock()
+            .unwrap()
+            .push(committed);
+        let id = create(
+            &mut first,
+            &mut first_status,
+            &context,
+            "servers",
+            &body,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            id,
+            "late-first"
+        );
+        first_status.external_id = Some(id);
+        save(
+            &mut first,
+            &first_status,
+            &context,
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(first_status.name_operation.is_none());
+    assert!(stored.lock().unwrap()["status"]["nameOperation"].is_null());
+    assert_eq!(
+        catalog
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row["name"] == "claimed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(
+                |request| request.method == "POST" || request.method == "PUT"
+            )
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_create_reserves_name_against_create_after_restart() {
+    delayed_name_claim(
+        false, false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ambiguous_create_reserves_name_against_rename_after_restart() {
+    delayed_name_claim(
+        false, true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ambiguous_rename_reserves_name_against_create_after_restart() {
+    delayed_name_claim(
+        true, false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ambiguous_rename_reserves_name_against_rename_after_restart() {
+    delayed_name_claim(
+        true, true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn definitive_name_rejections_release_claims() {
+    for rename in [false, true] {
+        let (kube, catalyst, context, mut first, stored) =
+            fixture_for(server_object()).await;
+        let (mut second, _) = peer_server(
+            &kube,
+            &first,
+            stored.clone(),
+        )
+        .await;
+        let catalog = name_catalog(
+            &catalyst,
+            vec![json!({"id": "first", "name": "before"})],
+        )
+        .await;
+        Mock::given(method(if rename { "PUT" } else { "POST" }))
+            .and(path(if rename { "/servers/first" } else { "/servers" }))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({"code": "VALIDATION_ERROR"})),
+            )
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&catalyst)
+            .await;
+        let body =
+            json!({"name": "claimed", "description": marker(&first, "")});
+        let mut status = ResourceStatus::default();
+        let result = if rename {
+            super::server::update_server(
+                &mut first,
+                &mut status,
+                &context,
+                "first",
+                &body,
+            )
+            .await
+        } else {
+            create(
+                &mut first,
+                &mut status,
+                &context,
+                "servers",
+                &body,
+                false,
+            )
+            .await
+            .map(|_| ())
+        };
+        assert!(result.is_err());
+        assert!(status.name_operation.is_none());
+        save(
+            &mut first, &status, &context,
+        )
+        .await
+        .unwrap();
+        let second_body =
+            json!({"name": "claimed", "description": marker(&second, "")});
+        create(
+            &mut second,
+            &mut ResourceStatus::default(),
+            &context,
+            "servers",
+            &second_body,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            catalog
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row["name"] == "claimed")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_ambiguous_creation_blocks_unknown_name_claims() {
+    let (kube, _catalyst, context, object, stored) =
+        fixture_for(server_object()).await;
+    stored.lock().unwrap()["status"] =
+        json!({"operation": operation("Create")});
+    let (peer, _) = peer_server(
+        &kube, &object, stored,
+    )
+    .await;
+    let error = names::check(
+        &peer,
+        &ResourceStatus::default(),
+        &context,
+        "another-name",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("NameConflict")
+    );
+}
+
 fn server_object() -> Server {
     serde_json::from_value(json!({"apiVersion": "catalyst.catalystctl.io/v1alpha1", "kind": "Server", "metadata": {
         "name": "game", "namespace": "games", "uid": "uid-123", "resourceVersion": "1", "generation": 1,
@@ -141,6 +496,12 @@ async fn fixture_for<K: Managed>(
         .respond_with(StatusApi(kube_object.clone()))
         .mount(&kube_server)
         .await;
+    server_list(
+        &kube_server,
+        vec![kube_object.clone()],
+        5,
+    )
+    .await;
     let config = kube::Config::new(kube_server.uri().parse().unwrap());
     let leader = Arc::new(crate::runtime::Leadership::default());
     leader.renew();
@@ -164,6 +525,53 @@ async fn fixture_for<K: Managed>(
         context,
         object,
         kube_object,
+    )
+}
+
+async fn server_list(
+    kube: &MockServer,
+    objects: Vec<Arc<Mutex<Value>>>,
+    priority: u8,
+) {
+    Mock::given(method("GET"))
+        .and(path("/apis/catalyst.catalystctl.io/v1alpha1/servers"))
+        .respond_with(move |_: &Request| {
+            let items: Vec<_> = objects.iter().map(|object| object.lock().unwrap().clone()).collect();
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion": "catalyst.catalystctl.io/v1alpha1", "kind": "ServerList", "metadata": {}, "items": items
+            }))
+        })
+        .with_priority(priority)
+        .mount(kube)
+        .await;
+}
+
+async fn peer_server(
+    kube: &MockServer,
+    original: &Server,
+    first: Arc<Mutex<Value>>,
+) -> (
+    Server,
+    Arc<Mutex<Value>>,
+) {
+    let mut peer = original.clone();
+    peer.metadata.namespace = Some("other-games".into());
+    peer.metadata.uid = Some("another-uid".into());
+    let stored = Arc::new(Mutex::new(serde_json::to_value(&peer).unwrap()));
+    Mock::given(method("PATCH"))
+        .and(path("/apis/catalyst.catalystctl.io/v1alpha1/namespaces/other-games/servers/game/status"))
+        .respond_with(StatusApi(stored.clone()))
+        .mount(kube).await;
+    server_list(
+        kube,
+        vec![first, stored.clone()],
+        1,
+    )
+    .await;
+
+    (
+        peer, stored,
     )
 }
 
@@ -485,6 +893,91 @@ async fn lost_create_response_recovers_only_a_unique_owned_marker() {
 }
 
 #[tokio::test]
+async fn missing_name_journal_schema_prevents_external_creation() {
+    let (kube, catalyst, context, mut object) = fixture().await;
+    let original = serde_json::to_value(&object).unwrap();
+    Mock::given(method("PATCH"))
+        .and(path("/apis/catalyst.catalystctl.io/v1alpha1/namespaces/games/servers/game/status"))
+        .respond_with(move |request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let mut response = original.clone();
+            response["status"] = body["status"].clone();
+            response["status"].as_object_mut().unwrap().remove("nameOperation");
+            response["metadata"]["resourceVersion"] = json!("2");
+
+            ResponseTemplate::new(200).set_body_json(response)
+        }).with_priority(1).mount(&kube).await;
+    name_catalog(
+        &catalyst,
+        Vec::new(),
+    )
+    .await;
+    let body = json!({"name": "claimed", "description": marker(&object, "")});
+    let error = create(
+        &mut object,
+        &mut ResourceStatus::default(),
+        &context,
+        "servers",
+        &body,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("SchemaUpgradeRequired")
+    );
+    assert!(
+        !catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.method == "POST")
+    );
+}
+
+#[tokio::test]
+async fn malformed_creation_recovery_preserves_name_reservation() {
+    let (_kube, catalyst, context, mut object) = fixture().await;
+    Mock::given(method("GET"))
+        .and(path("/servers"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"data": [
+                    {"name": "claimed", "description": marker(&object, "")}
+                ]}),
+            ),
+        )
+        .mount(&catalyst)
+        .await;
+    let mut status = ResourceStatus {
+        operation: Some(operation("Create")),
+        name_operation: Some(
+            names::operation(
+                "claimed", None,
+            ),
+        ),
+        ..Default::default()
+    };
+    assert!(
+        create(
+            &mut object,
+            &mut status,
+            &context,
+            "servers",
+            &json!({"name": "claimed"}),
+            false
+        )
+        .await
+        .is_err()
+    );
+    assert!(status.operation.is_some());
+    assert!(status.name_operation.is_some());
+}
+
+#[tokio::test]
 async fn existing_name_is_not_adopted() {
     let (_kube, catalyst, context, mut object) = fixture().await;
     Mock::given(method("GET"))
@@ -517,19 +1010,19 @@ async fn existing_name_is_not_adopted() {
 
 #[tokio::test]
 async fn concurrent_creates_across_namespaces_allow_one_name_claim() {
-    let (kube, catalyst, context, mut first) = fixture().await;
+    let (kube, catalyst, context, mut first, first_stored) =
+        fixture_for(server_object()).await;
     let catalog = name_catalog(
         &catalyst,
         Vec::new(),
     )
     .await;
-    let mut second = first.clone();
-    second.metadata.namespace = Some("other-games".into());
-    second.metadata.uid = Some("another-uid".into());
-    Mock::given(method("PATCH"))
-        .and(path("/apis/catalyst.catalystctl.io/v1alpha1/namespaces/other-games/servers/game/status"))
-        .respond_with(StatusApi(Arc::new(Mutex::new(serde_json::to_value(&second).unwrap()))))
-        .mount(&kube).await;
+    let (mut second, _) = peer_server(
+        &kube,
+        &first,
+        first_stored,
+    )
+    .await;
     let mut first_status = ResourceStatus::default();
     let mut second_status = ResourceStatus::default();
     let first_body =
@@ -565,7 +1058,16 @@ async fn concurrent_creates_across_namespaces_allow_one_name_claim() {
 
 #[tokio::test]
 async fn concurrent_renames_allow_one_name_claim() {
-    let (_kube, catalyst, context, _object) = fixture().await;
+    let (kube, catalyst, context, mut first, first_stored) =
+        fixture_for(server_object()).await;
+    let (mut second, _) = peer_server(
+        &kube,
+        &first,
+        first_stored,
+    )
+    .await;
+    let mut first_status = ResourceStatus::default();
+    let mut second_status = ResourceStatus::default();
     let catalog = name_catalog(
         &catalyst,
         vec![
@@ -577,10 +1079,18 @@ async fn concurrent_renames_allow_one_name_claim() {
     let updates = json!({"name": "claimed"});
     let (left, right) = tokio::join!(
         super::server::update_server(
-            &context, "first", &updates
+            &mut first,
+            &mut first_status,
+            &context,
+            "first",
+            &updates
         ),
         super::server::update_server(
-            &context, "second", &updates
+            &mut second,
+            &mut second_status,
+            &context,
+            "second",
+            &updates
         ),
     );
     one_name_claim(
@@ -600,7 +1110,13 @@ async fn concurrent_renames_allow_one_name_claim() {
 
 #[tokio::test]
 async fn concurrent_create_and_rename_allow_one_name_claim() {
-    let (_kube, catalyst, context, mut object) = fixture().await;
+    let (kube, catalyst, context, mut object, stored) =
+        fixture_for(server_object()).await;
+    let (mut other, _) = peer_server(
+        &kube, &object, stored,
+    )
+    .await;
+    let mut other_status = ResourceStatus::default();
     let catalog = name_catalog(
         &catalyst,
         vec![json!({"id": "existing", "name": "before"})],
@@ -619,7 +1135,11 @@ async fn concurrent_create_and_rename_allow_one_name_claim() {
             false
         ),
         super::server::update_server(
-            &context, "existing", &updates
+            &mut other,
+            &mut other_status,
+            &context,
+            "existing",
+            &updates
         ),
     );
     one_name_claim(

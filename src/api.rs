@@ -225,6 +225,14 @@ pub struct Endpoint {
     pub protocol: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NameOperation {
+    pub name: String,
+    pub external_id: Option<String>,
+    pub started_at: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceStatus {
@@ -238,6 +246,7 @@ pub struct ResourceStatus {
     pub last_error_at: Option<String>,
     pub allocation_id: Option<String>,
     pub operation: Option<Operation>,
+    pub name_operation: Option<NameOperation>,
     pub runtime_template_id: Option<String>,
     pub snapshot_ref: Option<String>,
     pub source_digest: Option<String>,

@@ -13,6 +13,49 @@ pub(super) async fn cleanup<K: Managed>(
         return Ok(Action::await_change());
     }
 
+    if K::COLLECTION == "servers" {
+        names::recover_rename(
+            object, status, context,
+        )
+        .await?;
+
+        if status
+            .operation
+            .as_ref()
+            .is_some_and(|op| op.kind == "Create")
+        {
+            let name = status
+                .name_operation
+                .as_ref()
+                .map(|pending| pending.name.clone())
+                .unwrap_or_else(
+                    || {
+                        object
+                            .model()
+                            .name(&object.name_any())
+                            .to_owned()
+                    },
+                );
+            status.external_id = Some(
+                create(
+                    object,
+                    status,
+                    context,
+                    "servers",
+                    &json!({"name": name}),
+                    false,
+                )
+                .await?,
+            );
+            save(
+                object, status, context,
+            )
+            .await?;
+        } else if status.name_operation.is_some() {
+            return Err(names::unknown());
+        }
+    }
+
     if object.model().deletion_policy() == &DeletionPolicy::Retain {
         return remove_finalizer(
             object, context,

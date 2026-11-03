@@ -234,11 +234,17 @@ async fn environment(
     Ok(result)
 }
 
-pub(super) async fn update_server(
+pub(super) async fn update_server<K: Managed>(
+    object: &mut K,
+    status: &mut ResourceStatus,
     context: &Context,
     id: &str,
     updates: &Value,
 ) -> Result<(), Error> {
+    if status.name_operation.is_some() {
+        return Err(names::unknown());
+    }
+
     let _name_lock = if let Some(name) = updates.get("name") {
         let guard = context.server_names.lock().await;
 
@@ -257,20 +263,59 @@ pub(super) async fn update_server(
             );
         }
 
+        let name = name.as_str().expect("server name");
+        names::check(
+            object, status, context, name,
+        )
+        .await?;
+        status.name_operation = Some(
+            names::operation(
+                name,
+                Some(id),
+            ),
+        );
+        save(
+            object, status, context,
+        )
+        .await?;
+        names::persisted(
+            object, status,
+        )?;
+
         Some(guard)
     } else {
         None
     };
 
     ensure_leader(context)?;
-    context
+    let response = context
         .catalyst
         .request(
             Method::PUT,
             &format!("servers/{id}"),
             Some(updates),
         )
-        .await?;
+        .await;
+
+    match response {
+        Ok(_) => {
+            names::recover_rename(
+                object, status, context,
+            )
+            .await?
+        }
+        Err(error) => {
+            if !error.ambiguous() {
+                status.name_operation = None;
+                save(
+                    object, status, context,
+                )
+                .await?;
+            }
+
+            return Err(error.into());
+        }
+    }
 
     Ok(())
 }
@@ -326,6 +371,11 @@ pub(super) async fn server<K: Managed>(
     context: &Context,
     spec: &ServerSpec,
 ) -> Result<Action, Error> {
+    names::recover_rename(
+        object, status, context,
+    )
+    .await?;
+
     if spec.primary_ip.is_some() {
         return Err(
             blocked(
@@ -813,7 +863,7 @@ pub(super) async fn server<K: Managed>(
 
     if !updates.as_object().unwrap().is_empty() {
         update_server(
-            context, &id, &updates,
+            object, status, context, &id, &updates,
         )
         .await?;
     }

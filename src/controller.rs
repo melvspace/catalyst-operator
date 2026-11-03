@@ -1,5 +1,6 @@
 mod catalog;
 mod cleanup;
+mod names;
 mod server;
 
 #[cfg(test)]
@@ -608,11 +609,8 @@ async fn create<K: Managed>(
 
     if journaled {
         if own.len() == 1 {
-            status.operation = None;
-
-            return own[0]["id"]
+            let id = own[0]["id"]
                 .as_str()
-                .map(str::to_owned)
                 .ok_or_else(
                     || {
                         blocked(
@@ -620,7 +618,12 @@ async fn create<K: Managed>(
                             "Recovered object has no ID",
                         )
                     },
-                );
+                )?
+                .to_owned();
+            status.operation = None;
+            status.name_operation = None;
+
+            return Ok(id);
         }
 
         return Err(
@@ -644,6 +647,21 @@ async fn create<K: Managed>(
         );
     }
 
+    if collection == "servers" {
+        let name = body["name"]
+            .as_str()
+            .expect("server name");
+        names::check(
+            object, status, context, name,
+        )
+        .await?;
+        status.name_operation = Some(
+            names::operation(
+                name, None,
+            ),
+        );
+    }
+
     status.operation = Some(operation(kind));
     condition(
         object,
@@ -657,6 +675,9 @@ async fn create<K: Managed>(
         object, status, context,
     )
     .await?;
+    names::persisted(
+        object, status,
+    )?;
     ensure_leader(context)?;
     let response = context
         .catalyst
@@ -676,12 +697,14 @@ async fn create<K: Managed>(
                 )
             })?;
             status.operation = None;
+            status.name_operation = None;
 
             Ok(id.into())
         }
         Err(error) => {
             if !error.ambiguous() {
                 status.operation = None;
+                status.name_operation = None;
             }
 
             Err(error.into())

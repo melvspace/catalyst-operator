@@ -148,6 +148,20 @@ spec:
                 items:
                   type: string
                 type: array
+              nameOperation:
+                nullable: true
+                properties:
+                  externalId:
+                    nullable: true
+                    type: string
+                  name:
+                    type: string
+                  startedAt:
+                    type: string
+                required:
+                - name
+                - startedAt
+                type: object
               observedGeneration:
                 format: int64
                 nullable: true
@@ -476,6 +490,20 @@ spec:
                 items:
                   type: string
                 type: array
+              nameOperation:
+                nullable: true
+                properties:
+                  externalId:
+                    nullable: true
+                    type: string
+                  name:
+                    type: string
+                  startedAt:
+                    type: string
+                required:
+                - name
+                - startedAt
+                type: object
               observedGeneration:
                 format: int64
                 nullable: true
@@ -815,6 +843,20 @@ spec:
                 items:
                   type: string
                 type: array
+              nameOperation:
+                nullable: true
+                properties:
+                  externalId:
+                    nullable: true
+                    type: string
+                  name:
+                    type: string
+                  startedAt:
+                    type: string
+                required:
+                - name
+                - startedAt
+                type: object
               observedGeneration:
                 format: int64
                 nullable: true

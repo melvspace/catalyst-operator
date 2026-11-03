@@ -6,7 +6,7 @@ A Rust / kube-rs Kubernetes operator for declarative [Catalyst](https://github.c
 
 The namespaced `Nest`, `Template`, and `Server` resources use `catalyst.catalystctl.io/v1alpha1`. References stay within a namespace, and dependencies reconcile in order. Catalyst names default to `metadata.name`; `spec.name` overrides them. Existing Catalyst objects are never adopted automatically.
 
-Server name claims are serialized within the active operator. Catalyst does not enforce unique server names, so coordinate external writers that create or rename servers.
+Server name claims are serialized within the active operator and journaled in `status.nameOperation` before creation or rename. Other Servers check these reservations across namespaces, so ambiguous requests keep their claims across operator restarts. Catalyst does not enforce unique server names, so coordinate external writers that create or rename servers.
 
 ## Build and install
 
@@ -126,6 +126,8 @@ Server status exposes TCP/UDP endpoints using the bound address or Catalyst node
 Kubernetes owns declared fields. Conflicting Catalyst changes are reconciled back. Checks run every 30 seconds by default; custom-resource, referenced Secret, and ConfigMap changes trigger reconciliation immediately.
 
 Creation, installation, and power requests are separate operations. Intent is persisted before non-idempotent calls, with resource-version checks and Lease leadership limiting concurrent writers. After an ambiguous create response, the operator searches for its Kubernetes UID marker. It never retries creation without a uniquely recoverable result. Preserve those description markers.
+
+An ambiguous rename reports `NameOutcomeUnknown` until the requested name becomes visible in Catalyst. The operator retains its name reservation and blocks deletion while the outcome is unresolved. Inspect Catalyst/backend requests and complete the rename manually if needed. Clear `status.nameOperation` only after confirming that no request remains in flight and that releasing the name is safe. `retryToken` does not release name reservations. Unresolved creations from older operator versions can block all new name claims because their original requested names were not recorded.
 
 Environment and startup changes update Catalyst configuration but leave a running process untouched. Quota and port changes wait for the server to stop. Change `spec.restartToken` to authorize the stop/update/start cycle, or request `powerState: Stopped` to stop and apply the configuration without starting it. Pending changes report `RestartRequired`. Stopping a `Running` server through Catalyst alone is temporary.
 
