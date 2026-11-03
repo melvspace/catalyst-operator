@@ -1,0 +1,27 @@
+image:
+  repository: ghcr.io/catalystctl/catalyst-operator
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+catalyst:
+  # API base URL must include /api. Configure a reachable Catalyst installation.
+  url: ""
+  existingSecret: catalyst-api
+  secretKey: api-key
+pollSeconds: 30
+maxRecoveryAttempts: 5
+operationTimeoutSeconds: 900
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+networkPolicy:
+  enabled: true
+  # Required: allow API server, Catalyst, and HTTPS egg source destinations.
+  # Use namespaceSelector/podSelector or ipBlock rules appropriate to your CNI.
+  egress: []
+nodeSelector: {}
+tolerations: []
+affinity: {}

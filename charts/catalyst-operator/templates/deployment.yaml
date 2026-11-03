@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "catalyst-operator.name" . }}
+  labels:
+    {{- include "catalyst-operator.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "catalyst-operator.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "catalyst-operator.selector" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "catalyst-operator.name" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: CATALYST_URL
+              value: {{ required "Set catalyst.url to your Catalyst /api URL" .Values.catalyst.url | quote }}
+            - name: CATALYST_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.catalyst.existingSecret }}
+                  key: {{ .Values.catalyst.secretKey }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: POLL_SECONDS
+              value: {{ .Values.pollSeconds | quote }}
+            - name: MAX_RECOVERY_ATTEMPTS
+              value: {{ .Values.maxRecoveryAttempts | quote }}
+            - name: OPERATION_TIMEOUT_SECONDS
+              value: {{ .Values.operationTimeoutSeconds | quote }}
+          ports:
+            - name: health
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

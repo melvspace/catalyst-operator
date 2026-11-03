@@ -1,0 +1,17 @@
+apiVersion: catalyst.catalystctl.io/v1alpha1
+kind: Template
+metadata:
+  name: native-java
+spec:
+  native:
+    author: cluster-admin
+    version: "1.0.0"
+    image: ghcr.io/pterodactyl/yolks:java_21
+    startup: java -Xmx{{SERVER_MEMORY}}M -jar server.jar nogui
+    stopCommand: stop
+    sendSignalTo: SIGTERM
+    supportedPorts: [25565]
+    allocatedMemoryMb: 2048
+    allocatedCpuCores: 2
+    variables: []
+    features: {}

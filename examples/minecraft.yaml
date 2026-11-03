@@ -1,0 +1,64 @@
+apiVersion: catalyst.catalystctl.io/v1alpha1
+kind: Nest
+metadata:
+  name: minecraft
+spec:
+  description: Minecraft server templates
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: paper-egg
+data:
+  egg.json: |
+    {
+      "meta": {"version": "PTDL_v2"},
+      "name": "Paper",
+      "author": "example",
+      "docker_images": {"Java 21": "ghcr.io/pterodactyl/yolks:java_21"},
+      "startup": "java -Xmx{{SERVER_MEMORY}}M -jar server.jar nogui",
+      "config": {"stop": "stop"},
+      "scripts": {"installation": {
+        "container": "ghcr.io/pterodactyl/installers:debian",
+        "entrypoint": "bash",
+        "script": "#!/bin/bash\nset -euo pipefail\ncd /mnt/server\ncurl -fL \"${SERVER_JAR_URL}\" -o server.jar\necho eula=true > eula.txt\n"
+      }},
+      "variables": [{
+        "name": "Server jar URL",
+        "env_variable": "SERVER_JAR_URL",
+        "default_value": "",
+        "rules": "required|string"
+      }]
+    }
+---
+apiVersion: catalyst.catalystctl.io/v1alpha1
+kind: Template
+metadata:
+  name: paper
+spec:
+  nestRef:
+    name: minecraft
+  egg:
+    configMapKeyRef:
+      name: paper-egg
+      key: egg.json
+---
+apiVersion: catalyst.catalystctl.io/v1alpha1
+kind: Server
+metadata:
+  name: survival
+spec:
+  templateRef:
+    name: paper
+  nodeId: REPLACE_WITH_CATALYST_NODE_ID
+  locationId: REPLACE_WITH_CATALYST_LOCATION_ID
+  resources:
+    cpu: 2
+    memory: 2Gi
+    disk: 20Gi
+  primaryPort: 25565
+  powerState: Running
+  deletionPolicy: Retain
+  environment:
+    SERVER_JAR_URL:
+      value: REPLACE_WITH_PINNED_PAPER_JAR_HTTPS_URL

@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "catalyst-operator.name" . }}
+  labels:
+    {{- include "catalyst-operator.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "catalyst-operator.name" . }}-{{ .Release.Namespace }}
+rules:
+  - apiGroups: [catalyst.catalystctl.io]
+    resources: [servers, templates, nests]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [catalyst.catalystctl.io]
+    resources: [servers/status, templates/status, nests/status]
+    verbs: [get, patch]
+  - apiGroups: [catalyst.catalystctl.io]
+    resources: [servers/finalizers, templates/finalizers, nests/finalizers]
+    verbs: [update, patch]
+  - apiGroups: [""]
+    resources: [secrets, configmaps]
+    verbs: [get, list, watch, create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "catalyst-operator.name" . }}-{{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "catalyst-operator.name" . }}-{{ .Release.Namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "catalyst-operator.name" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "catalyst-operator.name" . }}-lease
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "catalyst-operator.name" . }}-lease
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "catalyst-operator.name" . }}-lease
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "catalyst-operator.name" . }}
+    namespace: {{ .Release.Namespace }}
