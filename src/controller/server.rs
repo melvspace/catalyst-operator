@@ -541,6 +541,21 @@ pub(super) async fn server<K: Managed>(
     )
     .await?;
 
+    if let Some(allocation) = &allocation {
+        let ip = allocation["ip"]
+            .as_str()
+            .filter(|ip| !ip.is_empty())
+            .ok_or_else(
+                || {
+                    blocked(
+                        "InvalidResponse",
+                        "Catalyst allocation has no IP address",
+                    )
+                },
+            )?;
+        env["CATALYST_NETWORK_IP"] = json!(ip);
+    }
+
     for (key, value) in [
         (
             "SERVER_MEMORY",
@@ -937,6 +952,7 @@ pub(super) async fn server<K: Managed>(
         .collect();
     let mut runtime_config = body.clone();
     runtime_config["allocationId"] = json!(spec.allocation_id);
+    runtime_config["restartPolicy"] = json!("never");
     runtime_config
         .as_object_mut()
         .unwrap()
@@ -955,6 +971,16 @@ pub(super) async fn server<K: Managed>(
         .await;
     }
 
+    if state == "running"
+        && spec.power_state == PowerState::Running
+        && status.restart_token == spec.restart_token
+    {
+        enforce_restart_policy(
+            object, status, context, &id, &actual,
+        )
+        .await?;
+    }
+
     power(
         object,
         status,
@@ -965,6 +991,73 @@ pub(super) async fn server<K: Managed>(
         &desired_digest,
     )
     .await
+}
+
+async fn enforce_restart_policy<K: Managed>(
+    object: &mut K,
+    status: &mut ResourceStatus,
+    context: &Context,
+    id: &str,
+    actual: &Value,
+) -> Result<(), Error> {
+    if actual["restartPolicy"] == "never" {
+        return Ok(());
+    }
+
+    if actual["status"] == "running" {
+        // The policy endpoint cannot change the agent's existing start plan.
+        status.running_digest = None;
+        condition(
+            object,
+            status,
+            false,
+            "RestartRequired",
+            "Disabling Catalyst agent restarts requires a process restart. Change spec.restartToken to authorize it.",
+            true,
+        );
+        save(
+            object, status, context,
+        )
+        .await?;
+
+        if object.status().running_digest.is_some() {
+            return Err(
+                blocked(
+                    "SchemaUpgradeRequired",
+                    "Kubernetes did not preserve the pending restart. Apply the current operator CRDs before continuing.",
+                ),
+            );
+        }
+    }
+
+    ensure_leader(context)?;
+    let response = context
+        .catalyst
+        .request(
+            Method::PATCH,
+            &format!("servers/{id}/restart-policy"),
+            Some(&json!({"restartPolicy": "never"})),
+        )
+        .await
+        .map_err(
+            |error| {
+                blocked(
+                    "RestartPolicyUnavailable",
+                    format!("{error}. Disabling Catalyst agent restarts requires server.update permission on the restart-policy endpoint. Restore API access before starting this server."),
+                )
+            },
+        )?;
+
+    if response["restartPolicy"] != "never" {
+        return Err(
+            blocked(
+                "RestartPolicyUnconfirmed",
+                "Catalyst did not confirm restartPolicy: never. Check the restart-policy endpoint and API compatibility before starting this server.",
+            ),
+        );
+    }
+
+    Ok(())
 }
 
 pub fn endpoints(actual: &Value) -> Vec<Endpoint> {
@@ -1440,6 +1533,22 @@ async fn power_request<K: Managed>(
                 ),
             );
         }
+    }
+
+    if endpoint == "start" {
+        let actual = context
+            .catalyst
+            .get(
+                "servers", id,
+            )
+            .await?
+            .ok_or_else(
+                || blocked("Missing", "Catalyst server disappeared before Start; reconcile its external identity before recovery"),
+            )?;
+        enforce_restart_policy(
+            object, status, context, id, &actual,
+        )
+        .await?;
     }
 
     let previous = status.clone();

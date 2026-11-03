@@ -999,6 +999,39 @@ impl Respond for ServerApi {
                 );
             }
 
+            // Catalyst validates bridge ports before resolving allocationId.
+            let ip = body["environment"]["CATALYST_NETWORK_IP"]
+                .as_str()
+                .or_else(|| actual["primaryIp"].as_str())
+                .unwrap_or("0.0.0.0");
+            let bindings = body
+                .get("portBindings")
+                .unwrap_or(&actual["portBindings"]);
+
+            if self
+                .allocations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(
+                    |row| {
+                        row["serverId"]
+                            .as_str()
+                            .is_some_and(|owner| owner != "id")
+                            && (row["ip"] == ip
+                                || ["0.0.0.0", "::"].contains(&ip))
+                            && bindings
+                                .as_object()
+                                .unwrap()
+                                .values()
+                                .any(|port| *port == row["port"])
+                    },
+                )
+            {
+                return ResponseTemplate::new(400)
+                    .set_body_json(json!({"code": "PORT_ALREADY_IN_USE"}));
+            }
+
             actual
                 .as_object_mut()
                 .unwrap()
@@ -1030,7 +1063,19 @@ impl Respond for ServerApi {
                     }
                 }
             }
+        } else if request.method == "PATCH" {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            actual["restartPolicy"] = body["restartPolicy"].clone();
+
+            return ResponseTemplate::new(200).set_body_json(
+                json!({"success": true, "restartPolicy": actual["restartPolicy"]}),
+            );
         } else if request.method == "POST" {
+            if request.url.path().ends_with("/start") {
+                actual["agentAutoRestartEnabled"] =
+                    json!(actual["restartPolicy"] != "never");
+            }
+
             actual["status"] = json!(
                 if request.url.path().ends_with("/stop") {
                     "stopped"
@@ -1141,9 +1186,9 @@ async fn server_fixture(state: &str) -> ServerFixture {
         .mount(&catalyst)
         .await;
     let actual = json!({"id": "id", "name": "game", "description": marker(&object, ""),
-        "templateId": "runtime", "nodeId": "node", "locationId": "location", "status": state,
+        "templateId": "runtime", "nodeId": "node", "locationId": "location", "status": state, "restartPolicy": "never",
         "allocatedMemoryMb": 2048, "allocatedCpuCores": 2, "allocatedDiskMb": 20480,
-        "primaryPort": 25565, "portBindings": {"25565": 25565}, "startupCommand": "java server.jar",
+        "primaryIp": "192.0.2.1", "primaryPort": 25565, "portBindings": {"25565": 25565}, "startupCommand": "java server.jar",
         "environment": {"SETTING": "old", "TEMPLATE_IMAGE": "java:21", "CATALYST_NETWORK_IP": "192.0.2.1"}
     });
     let backend = ServerApi {
@@ -1167,6 +1212,10 @@ async fn server_fixture(state: &str) -> ServerFixture {
         (
             "POST",
             "/servers/id/start",
+        ),
+        (
+            "PATCH",
+            "/servers/id/restart-policy",
         ),
     ] {
         Mock::given(method(verb))
@@ -1752,6 +1801,143 @@ fn timed_out_power(
     fixture.status.recovery_attempts = 5;
 
     started
+}
+
+#[tokio::test]
+async fn starts_disable_agent_restarts_and_crashes_exhaust_the_budget() {
+    for policy in ["on-failure", "always"] {
+        let mut fixture = server_fixture("stopped").await;
+        fixture.backend.actual.lock().unwrap()["restartPolicy"] = json!(policy);
+        fixture.object.spec.power_state = PowerState::Running;
+
+        for attempt in 1..=5 {
+            fixture.status.last_power_attempt_at = None;
+            fixture.reconcile_persisted().await;
+            fixture.reconcile_persisted().await;
+            assert!(fixture.status.ready());
+            assert_eq!(
+                fixture.status.recovery_attempts,
+                attempt
+            );
+            let actual = fixture.backend.actual.lock().unwrap();
+            assert_eq!(
+                actual["restartPolicy"],
+                "never"
+            );
+            assert_eq!(
+                actual["agentAutoRestartEnabled"],
+                false
+            );
+            drop(actual);
+            fixture.backend.actual.lock().unwrap()["status"] = json!("crashed");
+        }
+
+        fixture.status.last_power_attempt_at = None;
+        fixture.reconcile_persisted().await;
+        assert_eq!(
+            fixture.status.conditions[0].reason,
+            "RecoveryRequired"
+        );
+        let requests = fixture
+            .catalyst
+            .received_requests()
+            .await
+            .unwrap();
+        let mutations: Vec<_> = requests
+            .iter()
+            .filter(
+                |request| ["PATCH", "POST"].contains(&request.method.as_str()),
+            )
+            .map(|request| request.url.path())
+            .collect();
+        assert_eq!(
+            mutations[0],
+            "/servers/id/restart-policy"
+        );
+        assert_eq!(
+            mutations
+                .iter()
+                .filter(|path| **path == "/servers/id/start")
+                .count(),
+            5
+        );
+    }
+}
+
+#[tokio::test]
+async fn restart_policy_failure_blocks_start_with_permission_guidance() {
+    let mut fixture = server_fixture("stopped").await;
+    fixture.backend.actual.lock().unwrap()["restartPolicy"] =
+        json!("on-failure");
+    fixture.object.spec.power_state = PowerState::Running;
+    Mock::given(method("PATCH"))
+        .and(path("/servers/id/restart-policy"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(json!({"code": "PERMISSION_DENIED"})),
+        )
+        .with_priority(1)
+        .mount(&fixture.catalyst)
+        .await;
+    fixture.reconcile_persisted().await;
+    assert_eq!(
+        fixture.status.conditions[0].reason,
+        "RestartPolicyUnavailable"
+    );
+    assert!(
+        fixture
+            .status
+            .recovery_action
+            .as_deref()
+            .unwrap()
+            .contains("server.update")
+    );
+    assert_eq!(
+        fixture.status.recovery_attempts,
+        0
+    );
+    assert!(fixture.status.operation.is_none());
+    assert!(
+        !fixture
+            .catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.method == "POST")
+    );
+}
+
+#[tokio::test]
+async fn repaired_running_policy_needs_an_authorized_process_restart() {
+    let mut fixture = server_fixture("running").await;
+    fixture.backend.actual.lock().unwrap()["restartPolicy"] =
+        json!("on-failure");
+    fixture.reconcile_persisted().await;
+    assert_eq!(
+        fixture.status.conditions[0].reason,
+        "RestartRequired"
+    );
+    assert!(fixture.status.running_digest.is_none());
+    assert_eq!(
+        fixture.backend.actual.lock().unwrap()["restartPolicy"],
+        "never"
+    );
+    fixture.reconcile_persisted().await;
+    assert_eq!(
+        fixture.status.conditions[0].reason,
+        "RestartRequired"
+    );
+    fixture.object.spec.restart_token = "disable-agent-restarts".into();
+    fixture.reconcile_persisted().await;
+    fixture.status.last_power_attempt_at = None;
+    fixture.reconcile_persisted().await;
+    fixture.reconcile_persisted().await;
+    assert!(fixture.status.ready());
+    assert_eq!(
+        fixture.backend.actual.lock().unwrap()["agentAutoRestartEnabled"],
+        false
+    );
 }
 
 #[tokio::test]
@@ -2461,6 +2647,101 @@ async fn stopped_power_request_is_not_blocked_by_pending_resource_edits() {
         actual["allocatedCpuCores"],
         3
     );
+}
+
+#[tokio::test]
+async fn allocation_switch_checks_destination_ip_and_preserves_environment() {
+    for occupied_ip in ["192.0.2.1", "192.0.2.2"] {
+        for edit_environment in [false, true] {
+            for state in ["stopped", "running"] {
+                let mut fixture = server_fixture(state).await;
+                fixture.status.allocation_id = Some("old".into());
+                fixture.object.spec.allocation_id = Some("new".into());
+                fixture.object.spec.primary_port = 25566;
+                *fixture
+                    .backend
+                    .allocations
+                    .lock()
+                    .unwrap() = vec![
+                    json!({"id": "old", "serverId": "id", "ip": "192.0.2.1", "port": 25565}),
+                    json!({"id": "new", "serverId": null, "ip": "192.0.2.2", "port": 25566}),
+                    json!({"id": "occupied", "serverId": "other", "ip": occupied_ip, "port": 25566}),
+                ];
+
+                if edit_environment {
+                    fixture
+                        .object
+                        .spec
+                        .environment
+                        .get_mut("SETTING")
+                        .unwrap()
+                        .value = Some("new-value".into());
+                }
+
+                if state == "running" {
+                    fixture.reconcile_persisted().await;
+                    assert_eq!(
+                        fixture.status.conditions[0].reason,
+                        "RestartRequired"
+                    );
+                    assert_eq!(
+                        fixture.backend.actual.lock().unwrap()["status"],
+                        "running"
+                    );
+                    fixture.object.spec.restart_token = "move-address".into();
+                    fixture.reconcile_persisted().await;
+                    fixture.status.last_power_attempt_at = None;
+                }
+
+                fixture.reconcile_persisted().await;
+
+                if occupied_ip == "192.0.2.1" {
+                    fixture.reconcile_persisted().await;
+                    assert!(fixture.status.ready());
+                    let actual = fixture.backend.actual.lock().unwrap();
+                    assert_eq!(
+                        actual["primaryIp"],
+                        "192.0.2.2"
+                    );
+                    assert_eq!(
+                        actual["primaryPort"],
+                        25566
+                    );
+                    assert_eq!(
+                        actual["environment"]["SETTING"],
+                        if edit_environment { "new-value" } else { "old" }
+                    );
+                    assert_eq!(
+                        actual["environment"]["TEMPLATE_IMAGE"],
+                        "java:21"
+                    );
+                } else {
+                    assert!(!fixture.status.ready());
+                    assert!(
+                        fixture
+                            .status
+                            .last_error
+                            .as_deref()
+                            .unwrap()
+                            .contains("PORT_ALREADY_IN_USE")
+                    );
+                    let actual = fixture.backend.actual.lock().unwrap();
+                    assert_eq!(
+                        actual["primaryIp"],
+                        "192.0.2.1"
+                    );
+                    assert_eq!(
+                        actual["primaryPort"],
+                        25565
+                    );
+                    assert_eq!(
+                        fixture.status.allocation_id.as_deref(),
+                        Some("old")
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]
