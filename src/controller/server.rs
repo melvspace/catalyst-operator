@@ -320,6 +320,52 @@ pub(super) async fn update_server<K: Managed>(
     Ok(())
 }
 
+async fn primary_allocation(
+    context: &Context,
+    node_id: &str,
+    id: &str,
+    actual: &Value,
+) -> Result<Option<String>, Error> {
+    let Some(ip) = actual["primaryIp"].as_str() else {
+        return Ok(None);
+    };
+    let port = actual["primaryPort"]
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .ok_or_else(
+            || {
+                blocked(
+                    "InvalidResponse",
+                    "Catalyst server has an invalid primary port",
+                )
+            },
+        )?;
+    let assigned = context
+        .catalyst
+        .assigned_allocation(
+            node_id, id, ip, port,
+        )
+        .await?;
+
+    assigned
+        .map(
+            |assigned| {
+                assigned["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(
+                        || {
+                            blocked(
+                                "InvalidResponse",
+                                "Catalyst allocation has no ID",
+                            )
+                        },
+                    )
+            },
+        )
+        .transpose()
+}
+
 async fn selected_allocation(
     context: &Context,
     spec: &ServerSpec,
@@ -673,45 +719,39 @@ pub(super) async fn server<K: Managed>(
         );
     }
 
+    let actual_name = actual["name"].as_str().ok_or_else(
+        || {
+            blocked(
+                "InvalidResponse",
+                "Catalyst server has no name",
+            )
+        },
+    )?;
+
+    if actual["name"] == body["name"]
+        && status.applied_name.as_deref() != Some(actual_name)
+    {
+        names::confirm(
+            object,
+            context,
+            &id,
+            actual_name,
+        )
+        .await?;
+        status.applied_name = Some(actual_name.into());
+    }
+
     if spec.allocation_id.is_none() {
         // Recover ownership even if the assignment's status write was lost.
-        if let Some(ip) = actual["primaryIp"].as_str() {
-            let port = actual["primaryPort"]
-                .as_u64()
-                .and_then(|port| u16::try_from(port).ok())
-                .ok_or_else(
-                    || {
-                        blocked(
-                            "InvalidResponse",
-                            "Catalyst server has an invalid primary port",
-                        )
-                    },
-                )?;
-
-            if let Some(assigned) = context
-                .catalyst
-                .assigned_allocation(
-                    &spec.node_id,
-                    &id,
-                    ip,
-                    port,
-                )
-                .await?
-            {
-                status.allocation_id = Some(
-                    assigned["id"]
-                        .as_str()
-                        .ok_or_else(
-                            || {
-                                blocked(
-                                    "InvalidResponse",
-                                    "Catalyst allocation has no ID",
-                                )
-                            },
-                        )?
-                        .to_owned(),
-                );
-            }
+        if let Some(assigned) = primary_allocation(
+            context,
+            &spec.node_id,
+            &id,
+            &actual,
+        )
+        .await?
+        {
+            status.allocation_id = Some(assigned);
         }
 
         if status.allocation_id.is_some() {
@@ -733,6 +773,26 @@ pub(super) async fn server<K: Managed>(
                 blocked(
                     "AllocationConflict",
                     "The selected Catalyst allocation belongs to another server",
+                ),
+            );
+        }
+
+        if allocation["serverId"] == id
+            && (allocation["ip"] != actual["primaryIp"]
+                || allocation["port"] != actual["primaryPort"])
+        {
+            status.allocation_id = primary_allocation(
+                context,
+                &spec.node_id,
+                &id,
+                &actual,
+            )
+            .await?;
+
+            return Err(
+                blocked(
+                    "AllocationPromotionUnsupported",
+                    "The selected allocation is already assigned but does not match the server's primary address and port. Catalyst cannot safely promote it through this API. Restore the current primary allocation, choose a free allocation, or detach the secondary in Catalyst before selecting it.",
                 ),
             );
         }

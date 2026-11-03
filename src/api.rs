@@ -242,6 +242,7 @@ pub struct ResourceStatus {
     pub last_observed_at: Option<String>,
     pub external_id: Option<String>,
     pub external_state: Option<String>,
+    pub applied_name: Option<String>,
     pub last_error: Option<String>,
     pub last_error_at: Option<String>,
     pub allocation_id: Option<String>,

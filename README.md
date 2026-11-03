@@ -8,6 +8,8 @@ The namespaced `Nest`, `Template`, and `Server` resources use `catalyst.catalyst
 
 Server name claims are serialized within the active operator and journaled in `status.nameOperation` before creation or rename. Other Servers check these reservations across namespaces, so ambiguous requests keep their claims across operator restarts. Catalyst does not enforce unique server names, so coordinate external writers that create or rename servers.
 
+Confirmed names appear in `status.appliedName` and in ConfigMaps labeled `catalyst.catalystctl.io/name-identity=server` in the operator namespace. These records survive `Retain` deletion. Name checks verify their Catalyst IDs directly, avoiding stale server-list caches. Back up these ConfigMaps with the custom resources and snapshots; entries can be reused after the recorded server is deleted or changes its name.
+
 ## Build and install
 
 Build and publish the image to a registry your cluster can access:
@@ -118,6 +120,8 @@ Imported templates retain a canonical ConfigMap snapshot and source digest. Each
 ## Networking
 
 The initial implementation uses Catalyst bridge networking. `primaryPort` is explicit; optional `portBindings` maps container port strings to host ports. The primary port receives an identity mapping unless explicitly mapped. To bind a specific address, select an existing Catalyst `allocationId` whose port matches `primaryPort`; `primaryIp` is unsupported for bridge networking and is rejected. Change the allocation and primary port together to switch allocations. Removing an assigned allocation is unsupported by Catalyst's server-update API: restore the reference, select a different allocation, or migrate to a separate Server without an allocation.
+
+Selecting an already-owned secondary allocation reports `AllocationPromotionUnsupported` if its address or port differs from the effective primary binding. Restore the current primary reference, select a free allocation, or detach the secondary in Catalyst before selecting it. Status preserves the observed primary allocation instead of reporting the secondary as applied.
 
 Server status exposes TCP/UDP endpoints using the bound address or Catalyst node address and published host ports. An in-cluster proxy connects to those addresses. Your routing and node firewall must permit that path. The operator does not create Services, tunnels, proxy configuration, or game health checks.
 

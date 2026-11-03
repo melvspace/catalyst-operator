@@ -9,6 +9,78 @@ use wiremock::{
 #[derive(Clone)]
 struct StatusApi(Arc<Mutex<Value>>);
 
+#[derive(Clone, Default)]
+struct NameRecords(Arc<Mutex<std::collections::BTreeMap<String, Value>>>);
+
+impl Respond for NameRecords {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let mut records = self.0.lock().unwrap();
+
+        if request.method == "GET" {
+            let name = request
+                .url
+                .path()
+                .rsplit('/')
+                .next()
+                .unwrap();
+
+            return match records.get(name) {
+                Some(record) => ResponseTemplate::new(200).set_body_json(record),
+                None => ResponseTemplate::new(404).set_body_json(json!({"status": "Failure", "message": "not found", "reason": "NotFound", "code": 404})),
+            };
+        }
+
+        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
+        let name = if request.method == "POST" {
+            body["metadata"]["name"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        } else {
+            request
+                .url
+                .path()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+
+        if request.method == "POST" {
+            if records.contains_key(&name) {
+                return ResponseTemplate::new(409).set_body_json(json!({"message": "exists", "reason": "AlreadyExists", "code": 409}));
+            }
+
+            body["metadata"]["resourceVersion"] = json!("1");
+            records.insert(
+                name,
+                body.clone(),
+            );
+
+            return ResponseTemplate::new(201).set_body_json(body);
+        }
+
+        let record = records.get_mut(&name).unwrap();
+
+        if record["metadata"]["resourceVersion"]
+            != body["metadata"]["resourceVersion"]
+        {
+            return ResponseTemplate::new(409).set_body_json(json!({"message": "changed", "reason": "Conflict", "code": 409}));
+        }
+
+        let version = record["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            + 1;
+        record["data"] = body["data"].clone();
+        record["metadata"]["resourceVersion"] = json!(version.to_string());
+
+        ResponseTemplate::new(200).set_body_json(record.clone())
+    }
+}
+
 impl Respond for StatusApi {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
@@ -39,9 +111,12 @@ impl Respond for NameCatalog {
                 .path()
                 .strip_prefix("/servers/")
             {
-                return ResponseTemplate::new(200).set_body_json(
-                    json!({"data": rows.iter().find(|row| row["id"] == id)}),
-                );
+                return match rows.iter().find(|row| row["id"] == id) {
+                    Some(row) => ResponseTemplate::new(200)
+                        .set_body_json(json!({"data": row})),
+                    None => ResponseTemplate::new(404)
+                        .set_body_json(json!({"code": "SERVER_NOT_FOUND"})),
+                };
             }
 
             // Capture the catalog before delaying, exposing overlapping checks.
@@ -110,6 +185,7 @@ fn one_name_claim<T, U>(left: Result<T, Error>, right: Result<U, Error>) {
 fn restarted(context: &Context) -> Context {
     Context {
         client: context.client.clone(),
+        operator_namespace: context.operator_namespace.clone(),
         catalyst: context.catalyst.clone(),
         poll: context.poll,
         leader: context.leader.clone(),
@@ -313,6 +389,309 @@ async fn delayed_name_claim(first_rename: bool, second_rename: bool) {
     );
 }
 
+async fn stale_confirmed_name(
+    first_rename: bool,
+    second_rename: bool,
+    retained: bool,
+) {
+    let (kube, catalyst, context, mut first, stored) =
+        fixture_for(server_object()).await;
+    let (mut second, peer_stored) = peer_server(
+        &kube,
+        &first,
+        stored.clone(),
+    )
+    .await;
+    let mut rows = Vec::new();
+
+    if first_rename {
+        rows.push(json!({"id": "first", "name": "before-first"}));
+    }
+
+    if second_rename {
+        rows.push(json!({"id": "second", "name": "before-second"}));
+    }
+
+    let catalog = name_catalog(
+        &catalyst, rows,
+    )
+    .await;
+    let body = json!({"name": "claimed", "description": marker(&first, "")});
+    let mut first_status = ResourceStatus::default();
+
+    if first_rename {
+        first_status.external_id = Some("first".into());
+        super::server::update_server(
+            &mut first,
+            &mut first_status,
+            &context,
+            "first",
+            &body,
+        )
+        .await
+        .unwrap();
+    } else {
+        first_status.external_id = Some(
+            create(
+                &mut first,
+                &mut first_status,
+                &context,
+                "servers",
+                &body,
+                false,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+
+    save(
+        &mut first,
+        &first_status,
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(stored.lock().unwrap()["status"]["nameOperation"].is_null());
+    assert_eq!(
+        stored.lock().unwrap()["status"]["appliedName"],
+        "claimed"
+    );
+
+    if retained {
+        // The CR is gone while its confirmed external identity remains retained.
+        server_list(
+            &kube,
+            vec![peer_stored],
+            1,
+        )
+        .await;
+    }
+
+    Mock::given(method("GET"))
+        .and(path("/servers"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": []})),
+        )
+        .with_priority(1)
+        .mount(&catalyst)
+        .await;
+    let context = restarted(&context);
+    let mut second_status = ResourceStatus::default();
+    let body = json!({"name": "claimed", "description": marker(&second, "")});
+    let result = if second_rename {
+        second_status.external_id = Some("second".into());
+        super::server::update_server(
+            &mut second,
+            &mut second_status,
+            &context,
+            "second",
+            &body,
+        )
+        .await
+    } else {
+        create(
+            &mut second,
+            &mut second_status,
+            &context,
+            "servers",
+            &body,
+            false,
+        )
+        .await
+        .map(|_| ())
+    };
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("NameConflict")
+    );
+    assert_eq!(
+        catalog
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row["name"] == "claimed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(
+                |request| request.method == "POST" || request.method == "PUT"
+            )
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn confirmed_create_blocks_stale_create_lists_after_restart() {
+    for retained in [false, true] {
+        stale_confirmed_name(
+            false, false, retained,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn confirmed_create_blocks_stale_rename_lists_after_restart() {
+    for retained in [false, true] {
+        stale_confirmed_name(
+            false, true, retained,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn confirmed_rename_blocks_stale_create_lists_after_restart() {
+    for retained in [false, true] {
+        stale_confirmed_name(
+            true, false, retained,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn confirmed_rename_blocks_stale_rename_lists_after_restart() {
+    for retained in [false, true] {
+        stale_confirmed_name(
+            true, true, retained,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn legacy_identity_blocks_claims_when_server_list_is_stale() {
+    let mut first = server_object();
+    first.status = Some(
+        ResourceStatus {
+            external_id: Some("legacy".into()),
+            ..Default::default()
+        },
+    );
+    let (kube, catalyst, context, first, stored) = fixture_for(first).await;
+    let (mut peer, _) = peer_server(
+        &kube, &first, stored,
+    )
+    .await;
+    name_catalog(
+        &catalyst,
+        vec![json!({"id": "legacy", "name": "claimed"})],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/servers"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": []})),
+        )
+        .with_priority(1)
+        .mount(&catalyst)
+        .await;
+    let error = create(
+        &mut peer,
+        &mut ResourceStatus::default(),
+        &context,
+        "servers",
+        &json!({"name": "claimed"}),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("NameConflict")
+    );
+}
+
+#[tokio::test]
+async fn confirmed_name_can_be_reused_after_identity_moves_or_disappears() {
+    for deleted in [false, true] {
+        let (kube, catalyst, context, mut first, stored) =
+            fixture_for(server_object()).await;
+        let (mut peer, peer_stored) = peer_server(
+            &kube, &first, stored,
+        )
+        .await;
+        let catalog = name_catalog(
+            &catalyst,
+            Vec::new(),
+        )
+        .await;
+        let body = json!({"name": "before", "description": marker(&first, "")});
+        let mut status = ResourceStatus::default();
+        let id = create(
+            &mut first,
+            &mut status,
+            &context,
+            "servers",
+            &body,
+            false,
+        )
+        .await
+        .unwrap();
+        status.external_id = Some(id.clone());
+        save(
+            &mut first, &status, &context,
+        )
+        .await
+        .unwrap();
+
+        if deleted {
+            catalog.0.lock().unwrap().clear();
+            server_list(
+                &kube,
+                vec![peer_stored],
+                1,
+            )
+            .await;
+        } else {
+            super::server::update_server(
+                &mut first,
+                &mut status,
+                &context,
+                &id,
+                &json!({"name": "after"}),
+            )
+            .await
+            .unwrap();
+        }
+
+        let body = json!({"name": "before", "description": marker(&peer, "")});
+        create(
+            &mut peer,
+            &mut ResourceStatus::default(),
+            &context,
+            "servers",
+            &body,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            catalog
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row["name"] == "before")
+                .count(),
+            1
+        );
+    }
+}
+
 #[tokio::test]
 async fn ambiguous_create_reserves_name_against_create_after_restart() {
     delayed_name_claim(
@@ -486,6 +865,14 @@ async fn fixture_for<K: Managed>(
 ) {
     let kube_server = MockServer::start().await;
     let catalyst_server = MockServer::start().await;
+    Mock::given(
+        wiremock::matchers::path_regex(
+            "^/api/v1/namespaces/operator/configmaps(?:/[^/]+)?$",
+        ),
+    )
+    .respond_with(NameRecords::default())
+    .mount(&kube_server)
+    .await;
     let kube_object =
         Arc::new(Mutex::new(serde_json::to_value(&object).unwrap()));
     Mock::given(method("PATCH"))
@@ -499,7 +886,7 @@ async fn fixture_for<K: Managed>(
     server_list(
         &kube_server,
         vec![kube_object.clone()],
-        5,
+        10,
     )
     .await;
     let config = kube::Config::new(kube_server.uri().parse().unwrap());
@@ -507,6 +894,7 @@ async fn fixture_for<K: Managed>(
     leader.renew();
     let context = Context {
         client: Client::try_from(config).unwrap(),
+        operator_namespace: "operator".into(),
         catalyst: Catalyst::new(
             &catalyst_server.uri(),
             "test".into(),
@@ -566,7 +954,7 @@ async fn peer_server(
     server_list(
         kube,
         vec![first, stored.clone()],
-        1,
+        5,
     )
     .await;
 
@@ -867,6 +1255,10 @@ async fn lost_create_response_recovers_only_a_unique_owned_marker() {
     Mock::given(method("GET")).and(path("/servers"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "recovered", "name": "game", "description": marker(&object, "")}]})))
         .mount(&catalyst).await;
+    Mock::given(method("GET")).and(path("/servers/recovered"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "id": "recovered", "name": "game", "description": marker(&object, "")
+        }}))).mount(&catalyst).await;
     let id = create(
         &mut object,
         &mut status,
@@ -975,6 +1367,49 @@ async fn malformed_creation_recovery_preserves_name_reservation() {
     );
     assert!(status.operation.is_some());
     assert!(status.name_operation.is_some());
+}
+
+#[tokio::test]
+async fn cached_creation_recovery_requires_a_live_uid_marker() {
+    for missing in [false, true] {
+        let (_kube, catalyst, context, mut object) = fixture().await;
+        Mock::given(method("GET")).and(path("/servers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [
+                {"id": "cached", "name": "claimed", "description": marker(&object, "")}
+            ]}))).mount(&catalyst).await;
+        Mock::given(method("GET")).and(path("/servers/cached"))
+            .respond_with(if missing {
+                ResponseTemplate::new(404).set_body_json(json!({"code": "SERVER_NOT_FOUND"}))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({"data": {"id": "cached", "name": "claimed", "description": "another owner"}}))
+            }).mount(&catalyst).await;
+        let mut status = ResourceStatus {
+            operation: Some(operation("Create")),
+            name_operation: Some(
+                names::operation(
+                    "claimed", None,
+                ),
+            ),
+            ..Default::default()
+        };
+        let error = create(
+            &mut object,
+            &mut status,
+            &context,
+            "servers",
+            &json!({"name": "claimed"}),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("CreateOutcomeUnknown")
+        );
+        assert!(status.operation.is_some());
+        assert!(status.name_operation.is_some());
+    }
 }
 
 #[tokio::test]
@@ -1639,6 +2074,61 @@ async fn allocation_switch_validates_selected_port_and_recovers_status() {
         allocations[1]["serverId"],
         "id"
     );
+}
+
+#[tokio::test]
+async fn selecting_an_owned_secondary_allocation_reports_primary_mismatch() {
+    for secondary_port in [25565, 25566] {
+        let mut fixture = server_fixture("stopped").await;
+        fixture.backend.actual.lock().unwrap()["primaryIp"] =
+            json!("192.0.2.1");
+        fixture.status.allocation_id = Some("primary".into());
+        fixture.object.spec.allocation_id = Some("secondary".into());
+        fixture.object.spec.primary_port = secondary_port;
+        *fixture
+            .backend
+            .allocations
+            .lock()
+            .unwrap() = vec![
+            json!({"id": "primary", "serverId": "id", "ip": "192.0.2.1", "port": 25565}),
+            json!({"id": "secondary", "serverId": "id", "ip": "192.0.2.2", "port": secondary_port}),
+        ];
+        fixture.object.status = Some(fixture.status.clone());
+        fixture.kube_object.lock().unwrap()["spec"] =
+            serde_json::to_value(&fixture.object.spec).unwrap();
+        let observed = fixture.kube_object.clone();
+        reconcile(
+            Arc::new(fixture.object),
+            Arc::new(fixture.context),
+        )
+        .await
+        .unwrap();
+        let status: ResourceStatus =
+            serde_json::from_value(observed.lock().unwrap()["status"].clone())
+                .unwrap();
+        assert_eq!(
+            status.allocation_id.as_deref(),
+            Some("primary")
+        );
+        assert!(!status.ready());
+        assert_eq!(
+            status.conditions[0].reason,
+            "AllocationPromotionUnsupported"
+        );
+        assert_eq!(
+            fixture.backend.actual.lock().unwrap()["primaryIp"],
+            "192.0.2.1"
+        );
+        assert!(
+            !fixture
+                .catalyst
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method == "PUT")
+        );
+    }
 }
 
 #[tokio::test]

@@ -57,6 +57,13 @@ pub(super) async fn cleanup<K: Managed>(
     }
 
     if object.model().deletion_policy() == &DeletionPolicy::Retain {
+        if K::COLLECTION == "servers" {
+            names::retain(
+                object, status, context,
+            )
+            .await?;
+        }
+
         return remove_finalizer(
             object, context,
         )

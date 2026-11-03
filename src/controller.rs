@@ -61,6 +61,7 @@ fn blocked(reason: &'static str, message: impl Into<String>) -> Error {
 
 pub struct Context {
     pub client: Client,
+    pub operator_namespace: String,
     pub catalyst: Catalyst,
     pub poll: Duration,
     pub leader: Arc<crate::runtime::Leadership>,
@@ -620,6 +621,26 @@ async fn create<K: Managed>(
                     },
                 )?
                 .to_owned();
+
+            if collection == "servers" {
+                let actual = context.catalyst.get("servers", &id).await?
+                    .filter(|server| server["description"].as_str().unwrap_or("").lines().any(|line| line == expected_marker))
+                    .ok_or_else(|| blocked("CreateOutcomeUnknown", "The cached UID match is not confirmed by a live server identity. Wait for the created server or inspect Catalyst before recovering it; creation is never repeated automatically."))?;
+                let name = actual["name"].as_str().ok_or_else(
+                    || {
+                        blocked(
+                            "InvalidResponse",
+                            "Recovered server has no name",
+                        )
+                    },
+                )?;
+                names::confirm(
+                    object, context, &id, name,
+                )
+                .await?;
+                status.applied_name = Some(name.into());
+            }
+
             status.operation = None;
             status.name_operation = None;
 
@@ -696,6 +717,18 @@ async fn create<K: Managed>(
                     "Create succeeded without a usable ID; inspect Catalyst before retrying",
                 )
             })?;
+
+            if collection == "servers" {
+                let name = body["name"]
+                    .as_str()
+                    .expect("server name");
+                names::confirm(
+                    object, context, id, name,
+                )
+                .await?;
+                status.applied_name = Some(name.into());
+            }
+
             status.operation = None;
             status.name_operation = None;
 

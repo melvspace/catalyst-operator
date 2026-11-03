@@ -58,6 +58,9 @@ spec:
                 format: uint32
                 minimum: 0.0
                 type: integer
+              appliedName:
+                nullable: true
+                type: string
               conditions:
                 default: []
                 items:
@@ -400,6 +403,9 @@ spec:
                 format: uint32
                 minimum: 0.0
                 type: integer
+              appliedName:
+                nullable: true
+                type: string
               conditions:
                 default: []
                 items:
@@ -753,6 +759,9 @@ spec:
                 format: uint32
                 minimum: 0.0
                 type: integer
+              appliedName:
+                nullable: true
+                type: string
               conditions:
                 default: []
                 items:

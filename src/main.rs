@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let context = Arc::new(
         Context {
             client: client.clone(),
+            operator_namespace: namespace.clone(),
             catalyst: Catalyst::new(
                 &env::var("CATALYST_URL").context(
                     "Set CATALYST_URL to the API base, including /api",
