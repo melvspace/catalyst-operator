@@ -18,42 +18,49 @@ pub(super) async fn cleanup<K: Managed>(
             object, status, context,
         )
         .await?;
+    }
 
-        if status
-            .operation
-            .as_ref()
-            .is_some_and(|op| op.kind == "Create")
-        {
-            let name = status
-                .name_operation
-                .as_ref()
-                .map(|pending| pending.name.clone())
-                .unwrap_or_else(
-                    || {
-                        object
-                            .model()
-                            .name(&object.name_any())
-                            .to_owned()
-                    },
-                );
-            status.external_id = Some(
-                create(
-                    object,
-                    status,
-                    context,
-                    "servers",
-                    &json!({"name": name}),
-                    false,
-                )
-                .await?,
-            );
-            save(
-                object, status, context,
-            )
-            .await?;
-        } else if status.name_operation.is_some() {
-            return Err(names::unknown());
+    if let Some(op) = &status.operation
+        && ["Create", "CreateRuntimeTemplate"].contains(&op.kind.as_str())
+    {
+        // A matching journal makes create recover-only, including under Retain.
+        let runtime = op.kind == "CreateRuntimeTemplate";
+        let collection = if runtime { "templates" } else { K::COLLECTION };
+        let id = create(
+            object,
+            status,
+            context,
+            collection,
+            &json!({}),
+            runtime,
+        )
+        .await?;
+
+        if runtime {
+            status.runtime_template_id = Some(id);
+        } else {
+            status.external_id = Some(id);
         }
+
+        save(
+            object, status, context,
+        )
+        .await?;
+    }
+
+    if K::COLLECTION == "servers" && status.name_operation.is_some() {
+        return Err(names::unknown());
+    }
+
+    if let Some(op) = &status.operation
+        && ["CleanupUnconfirmed", "Delete"].contains(&op.kind.as_str())
+    {
+        return Err(
+            blocked(
+                "CleanupUnconfirmed",
+                "Delete outcome or node cleanup is unconfirmed. Inspect Catalyst/node resources before manually removing the finalizer.",
+            ),
+        );
     }
 
     if object.model().deletion_policy() == &DeletionPolicy::Retain {
@@ -154,17 +161,6 @@ pub(super) async fn cleanup<K: Managed>(
         Model::Server(_) => {}
     }
 
-    if let Some(op) = &status.operation
-        && ["Create", "CreateRuntimeTemplate"].contains(&op.kind.as_str())
-    {
-        return Err(
-            blocked(
-                "DeletionBlocked",
-                "Creation outcome is unresolved. Recover the external identity before deleting this CR.",
-            ),
-        );
-    }
-
     if let Some(id) = status.external_id.clone()
         && let Some(actual) = context
             .catalyst
@@ -174,11 +170,42 @@ pub(super) async fn cleanup<K: Managed>(
             )
             .await?
     {
-        if K::COLLECTION == "servers"
-            && !["stopped", "crashed", "error"]
-                .contains(&actual["status"].as_str().unwrap_or(""))
-        {
-            if actual["status"] == "installing" {
+        if let Model::Server(spec) = object.model() {
+            let state = actual["status"]
+                .as_str()
+                .unwrap_or("unknown");
+            status.external_state = Some(state.into());
+            status.endpoints = server::endpoints(&actual);
+            observed(
+                status,
+                context.poll,
+            );
+
+            if status
+                .operation
+                .as_ref()
+                .is_some_and(|op| op.kind == "Install")
+            {
+                return server::install(
+                    object, status, context, &spec, &id, state,
+                )
+                .await;
+            }
+
+            if status.operation.as_ref().is_some_and(
+                |op| {
+                    ["Start", "Stop", "RestartStop", "DeleteStop"]
+                        .contains(&op.kind.as_str())
+                },
+            ) && let Some(action) = server::power_transition(
+                object, status, context, &spec, state,
+            )
+            .await?
+            {
+                return Ok(action);
+            }
+
+            if state == "installing" {
                 return Err(
                     blocked(
                         "DeletionBlocked",
@@ -187,37 +214,34 @@ pub(super) async fn cleanup<K: Managed>(
                 );
             }
 
-            if status.operation.as_ref().is_none_or(
-                |op| {
-                    op.kind != "DeleteStop"
-                        || expired(
-                            op,
-                            context.operation_timeout,
-                        )
-                },
-            ) {
-                status.operation = Some(operation("DeleteStop"));
-                save(
-                    object, status, context,
+            if ["running", "starting"].contains(&state) {
+                let digest = status
+                    .configuration_digest
+                    .clone()
+                    .unwrap_or_default();
+
+                return server::power_request(
+                    object,
+                    status,
+                    context,
+                    &spec,
+                    &id,
+                    "DeleteStop",
+                    &digest,
                 )
-                .await?;
-                ensure_leader(context)?;
-                context
-                    .catalyst
-                    .request(
-                        Method::POST,
-                        &format!("servers/{id}/stop"),
-                        Some(&json!({})),
-                    )
-                    .await?;
+                .await;
             }
 
-            return Err(
-                blocked(
-                    "Deleting",
-                    "Waiting for the server to stop before deletion",
-                ),
-            );
+            if !["stopped", "crashed", "error"].contains(&state) {
+                return Err(
+                    blocked(
+                        "DeletionBlocked",
+                        format!(
+                            "Waiting for Catalyst state {state} to resolve before deletion. Inspect Catalyst/node logs; no additional Stop is dispatched during an external transition."
+                        ),
+                    ),
+                );
+            }
         }
 
         status.operation = Some(operation("Delete"));
@@ -236,7 +260,17 @@ pub(super) async fn cleanup<K: Managed>(
                 ),
                 None,
             )
-            .await?;
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if !error.ambiguous() {
+                    status.operation = None;
+                }
+
+                return Err(error.into());
+            }
+        };
 
         if response.get("warning").is_some()
             || response
@@ -264,17 +298,6 @@ pub(super) async fn cleanup<K: Managed>(
             object, status, context,
         )
         .await?;
-    }
-
-    if let Some(op) = &status.operation
-        && (op.kind == "CleanupUnconfirmed" || op.kind == "Delete")
-    {
-        return Err(
-            blocked(
-                "CleanupUnconfirmed",
-                "Delete outcome or node cleanup is unconfirmed. Inspect Catalyst/node resources before manually removing the finalizer.",
-            ),
-        );
     }
 
     if K::COLLECTION == "servers"

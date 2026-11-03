@@ -157,6 +157,8 @@ Status includes `Ready`, `Reconciling`, and `Stalled` conditions, observed gener
 
 All three resources default to `deletionPolicy: Retain`. Their external objects survive CR deletion. `Delete` stops and deletes servers, then removes their private runtime templates. Nests and templates block deletion while dependants remain, including external objects retained in Catalyst. Cleanup warnings or uncertain deletion outcomes retain the finalizer for manual review. Inspect Catalyst/node resources before manually removing `catalyst.catalystctl.io/cleanup`.
 
+Deletion preserves pending operation evidence. An ambiguous `DeleteStop` follows the same timeout and fresh `retryToken` rules as other power operations; it is never repeated solely because its timeout elapsed. Once the server reaches `stopped`, deletion continues. Pending creation of any Nest, Template, Server, or private runtime template blocks even `Retain` deletion until a unique live UID-marked identity is recovered and saved. Snapshots remain attached while the CR finalizer is held. Resolve uncertain external requests before manually clearing journals or finalizers; changing to `Retain` does not clear an uncertain Delete or cleanup warning.
+
 ## Development
 
 ```bash

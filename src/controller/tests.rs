@@ -889,6 +889,23 @@ async fn fixture_for<K: Managed>(
         10,
     )
     .await;
+    let patched_object = kube_object.clone();
+    Mock::given(method("PATCH"))
+        .and(path(format!(
+            "/apis/catalyst.catalystctl.io/v1alpha1/namespaces/games/{}/game",
+            K::COLLECTION,
+        )))
+        .respond_with(move |request: &Request| {
+            let patch: Value = serde_json::from_slice(&request.body).unwrap();
+            let mut object = patched_object.lock().unwrap();
+            object["metadata"]["finalizers"] = patch["metadata"]["finalizers"].clone();
+            let version = object["metadata"]["resourceVersion"].as_str().unwrap().parse::<u64>().unwrap() + 1;
+            object["metadata"]["resourceVersion"] = json!(version.to_string());
+
+            ResponseTemplate::new(200).set_body_json(object.clone())
+        })
+        .mount(&kube_server)
+        .await;
     let config = kube::Config::new(kube_server.uri().parse().unwrap());
     let leader = Arc::new(crate::runtime::Leadership::default());
     leader.renew();
@@ -972,6 +989,18 @@ struct ServerApi {
 impl Respond for ServerApi {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let mut actual = self.actual.lock().unwrap();
+
+        if request.method == "GET" && actual.is_null() {
+            return ResponseTemplate::new(404)
+                .set_body_json(json!({"code": "SERVER_NOT_FOUND"}));
+        }
+
+        if request.method == "DELETE" {
+            *actual = Value::Null;
+
+            return ResponseTemplate::new(200)
+                .set_body_json(json!({"success": true}));
+        }
 
         if request.method == "PUT" {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
@@ -1217,6 +1246,10 @@ async fn server_fixture(state: &str) -> ServerFixture {
             "PATCH",
             "/servers/id/restart-policy",
         ),
+        (
+            "DELETE",
+            "/servers/id",
+        ),
     ] {
         Mock::given(method(verb))
             .and(path(route))
@@ -1225,6 +1258,13 @@ async fn server_fixture(state: &str) -> ServerFixture {
             .await;
     }
 
+    Mock::given(method("DELETE"))
+        .and(path("/templates/runtime"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"success": true})),
+        )
+        .mount(&catalyst)
+        .await;
     let allocations = backend.allocations.clone();
     Mock::given(method("GET"))
         .and(path("/nodes/node/allocations"))
@@ -2358,10 +2398,440 @@ async fn exhausted_recovery_budget_prevents_another_start() {
     );
 }
 
+async fn deleting_server_fixture(state: &str) -> ServerFixture {
+    let mut fixture = server_fixture(state).await;
+    fixture.object.spec.deletion_policy = DeletionPolicy::Delete;
+    fixture
+        .object
+        .metadata
+        .deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
+    fixture.kube_object.lock().unwrap()["metadata"]["deletionTimestamp"] =
+        serde_json::to_value(
+            &fixture
+                .object
+                .metadata
+                .deletion_timestamp,
+        )
+        .unwrap();
+
+    fixture
+}
+
+#[tokio::test]
+async fn deletion_stop_timeout_retains_intent_until_fresh_authorization() {
+    let mut fixture = deleting_server_fixture("running").await;
+    Mock::given(method("POST"))
+        .and(path("/servers/id/stop"))
+        .respond_with(
+            ResponseTemplate::new(504)
+                .set_body_json(json!({"code": "GATEWAY_TIMEOUT"})),
+        )
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&fixture.catalyst)
+        .await;
+    fixture.reconcile_persisted().await;
+    assert_eq!(
+        fixture
+            .status
+            .operation
+            .as_ref()
+            .unwrap()
+            .kind,
+        "DeleteStop"
+    );
+    let old = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    fixture
+        .status
+        .operation
+        .as_mut()
+        .unwrap()
+        .started_at = old.clone();
+
+    for state in ["starting", "stopping", "running", "running"] {
+        fixture.backend.actual.lock().unwrap()["status"] = json!(state);
+
+        if state != "running" {
+            fixture.object.spec.retry_token = "early".into();
+        }
+
+        fixture.reconcile_persisted().await;
+        assert_eq!(
+            fixture.status.conditions[0].reason,
+            "RecoveryRequired"
+        );
+        assert_eq!(
+            fixture
+                .status
+                .operation
+                .as_ref()
+                .unwrap()
+                .started_at,
+            old
+        );
+        assert!(
+            fixture
+                .object
+                .finalizers()
+                .iter()
+                .any(|value| value == FINALIZER)
+        );
+    }
+
+    let requests = fixture
+        .catalyst
+        .received_requests()
+        .await
+        .unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        1
+    );
+    fixture.object.spec.retry_token = "resolved".into();
+    fixture.status.last_power_attempt_at = None;
+    fixture.reconcile_persisted().await;
+    assert_ne!(
+        fixture
+            .status
+            .operation
+            .as_ref()
+            .unwrap()
+            .started_at,
+        old
+    );
+    fixture.reconcile_persisted().await;
+    assert!(fixture.object.finalizers().is_empty());
+    assert!(
+        fixture
+            .backend
+            .actual
+            .lock()
+            .unwrap()
+            .is_null()
+    );
+    let requests = fixture
+        .catalyst
+        .received_requests()
+        .await
+        .unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn deletion_completes_a_timed_out_stop_without_another_dispatch() {
+    let mut fixture = deleting_server_fixture("stopped").await;
+    fixture.status.operation = Some(
+        Operation {
+            started_at: (Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+            retry_token: Some(String::new()),
+            ..operation("DeleteStop")
+        },
+    );
+    fixture.reconcile_persisted().await;
+    assert!(fixture.object.finalizers().is_empty());
+    assert!(
+        fixture
+            .catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method != "POST")
+    );
+}
+
+#[tokio::test]
+async fn deletion_preserves_pending_start_and_install_outcomes() {
+    for kind in ["Start", "Install"] {
+        let mut fixture = deleting_server_fixture("stopped").await;
+        let mut pending = operation(kind);
+        pending.started_at =
+            (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        pending.retry_token = Some(String::new());
+        fixture.status.operation = Some(pending.clone());
+        fixture.reconcile_persisted().await;
+        assert_eq!(
+            fixture.status.operation,
+            Some(pending)
+        );
+        assert!(
+            fixture
+                .object
+                .finalizers()
+                .iter()
+                .any(|value| value == FINALIZER)
+        );
+        assert!(
+            fixture
+                .catalyst
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+
+        if kind == "Start" {
+            fixture.backend.actual.lock().unwrap()["status"] = json!("running");
+        } else {
+            fixture
+                .object
+                .spec
+                .installation_confirmation_token = "confirmed".into();
+        }
+
+        fixture.reconcile_persisted().await;
+        fixture.reconcile_persisted().await;
+        assert!(fixture.object.finalizers().is_empty());
+        assert!(
+            fixture
+                .backend
+                .actual
+                .lock()
+                .unwrap()
+                .is_null()
+        );
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_delete_is_preserved_while_definite_rejection_can_retry() {
+    for code in [403, 504] {
+        let mut fixture = deleting_server_fixture("stopped").await;
+        Mock::given(method("DELETE"))
+            .and(path("/servers/id"))
+            .respond_with(
+                ResponseTemplate::new(code)
+                    .set_body_json(json!({"code": "TEST_FAILURE"})),
+            )
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&fixture.catalyst)
+            .await;
+        fixture.reconcile_persisted().await;
+
+        if code == 504 {
+            fixture.object.spec.deletion_policy = DeletionPolicy::Retain;
+        }
+
+        fixture.reconcile_persisted().await;
+        let requests = fixture
+            .catalyst
+            .received_requests()
+            .await
+            .unwrap();
+        let deletes = requests
+            .iter()
+            .filter(
+                |request| {
+                    request.method == "DELETE"
+                        && request.url.path() == "/servers/id"
+                },
+            )
+            .count();
+
+        if code == 504 {
+            assert_eq!(
+                deletes,
+                1
+            );
+            assert_eq!(
+                fixture.status.conditions[0].reason,
+                "CleanupUnconfirmed"
+            );
+            assert!(
+                fixture
+                    .object
+                    .finalizers()
+                    .iter()
+                    .any(|value| value == FINALIZER)
+            );
+            assert_eq!(
+                fixture
+                    .status
+                    .operation
+                    .as_ref()
+                    .unwrap()
+                    .kind,
+                "Delete"
+            );
+        } else {
+            assert_eq!(
+                deletes,
+                2
+            );
+            assert!(fixture.object.finalizers().is_empty());
+        }
+    }
+}
+
+async fn retain_pending_creation<K: Managed>(mut object: K, runtime: bool) {
+    object.meta_mut().deletion_timestamp =
+        Some(Time(k8s_openapi::jiff::Timestamp::now()));
+    let pending = operation(
+        if runtime {
+            "CreateRuntimeTemplate"
+        } else {
+            "Create"
+        },
+    );
+    object.set_status(
+        ResourceStatus {
+            operation: Some(pending.clone()),
+            ..Default::default()
+        },
+    );
+    let (kube, catalyst, context, mut object, stored) =
+        fixture_for(object).await;
+    let collection = if runtime { "templates" } else { K::COLLECTION };
+    let rows = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let listed = rows.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/{collection}")))
+        .respond_with(
+            move |_: &Request| {
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"data": listed.lock().unwrap().clone()}),
+                )
+            },
+        )
+        .mount(&catalyst)
+        .await;
+    let returned = rows.clone();
+    let visible = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let live = visible.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/{collection}/recovered")))
+        .respond_with(
+            move |_: &Request| {
+                if !live.load(std::sync::atomic::Ordering::SeqCst) {
+                    return ResponseTemplate::new(404)
+                        .set_body_json(json!({"code": "NOT_FOUND"}));
+                }
+
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": returned.lock().unwrap()[0]}))
+            },
+        )
+        .mount(&catalyst)
+        .await;
+
+    for _ in 0..2 {
+        reconcile(
+            Arc::new(object),
+            Arc::new(restarted(&context)),
+        )
+        .await
+        .unwrap();
+        object =
+            serde_json::from_value(stored.lock().unwrap().clone()).unwrap();
+        assert!(
+            object
+                .finalizers()
+                .iter()
+                .any(|value| value == FINALIZER)
+        );
+        assert_eq!(
+            object.status().operation,
+            Some(pending.clone())
+        );
+        assert!(!object.status().ready());
+    }
+
+    rows.lock().unwrap().push(json!({"id": "recovered", "name": "game", "description": marker(&object, if runtime { ":runtime" } else { "" })}));
+    reconcile(
+        Arc::new(object),
+        Arc::new(restarted(&context)),
+    )
+    .await
+    .unwrap();
+    let object: K =
+        serde_json::from_value(stored.lock().unwrap().clone()).unwrap();
+    assert!(
+        object
+            .finalizers()
+            .iter()
+            .any(|value| value == FINALIZER)
+    );
+    assert_eq!(
+        object.status().operation,
+        Some(pending)
+    );
+    visible.store(
+        true,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    reconcile(
+        Arc::new(object),
+        Arc::new(restarted(&context)),
+    )
+    .await
+    .unwrap();
+    let object: K =
+        serde_json::from_value(stored.lock().unwrap().clone()).unwrap();
+    assert!(object.finalizers().is_empty());
+    assert!(object.status().operation.is_none());
+    let status = object.status();
+    assert_eq!(
+        if runtime {
+            status.runtime_template_id.as_deref()
+        } else {
+            status.external_id.as_deref()
+        },
+        Some("recovered")
+    );
+    assert!(
+        catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method == "GET")
+    );
+    drop(kube);
+}
+
+#[tokio::test]
+async fn retain_preserves_all_unresolved_creation_journals_until_recovery() {
+    let server = server_object();
+    let metadata = server.metadata.clone();
+    retain_pending_creation(
+        server.clone(),
+        true,
+    )
+    .await;
+    retain_pending_creation(
+        server, false,
+    )
+    .await;
+    let template: Template = serde_json::from_value(json!({"metadata": metadata, "spec": {"egg": {"configMapKeyRef": {"name": "egg", "key": "egg.json"}}}})).unwrap();
+    retain_pending_creation(
+        template, false,
+    )
+    .await;
+    let nest: Nest =
+        serde_json::from_value(json!({"metadata": metadata, "spec": {}}))
+            .unwrap();
+    retain_pending_creation(
+        nest, false,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn cleanup_warnings_survive_a_missing_external_record() {
-    let (_kube, catalyst, context, mut object) = fixture().await;
+    let mut object = server_object();
     object.spec.deletion_policy = DeletionPolicy::Delete;
+    let (_kube, catalyst, context, mut object, _) = fixture_for(object).await;
     let mut status = ResourceStatus {
         external_id: Some("id".into()),
         ..Default::default()
@@ -2405,6 +2875,7 @@ async fn cleanup_warnings_survive_a_missing_external_record() {
         status.operation.as_ref().unwrap().kind,
         "CleanupUnconfirmed"
     );
+    object.spec.deletion_policy = DeletionPolicy::Retain;
     assert!(
         cleanup(
             &mut object,

@@ -623,10 +623,32 @@ async fn create<K: Managed>(
                 )?
                 .to_owned();
 
+            let actual = context
+                .catalyst
+                .get(
+                    collection,
+                    &id,
+                )
+                .await?
+                .filter(
+                    |actual| {
+                        actual["description"]
+                            .as_str()
+                            .unwrap_or("")
+                            .lines()
+                            .any(|line| line == expected_marker)
+                    },
+                )
+                .ok_or_else(
+                    || {
+                        blocked(
+                            "CreateOutcomeUnknown",
+                            "The cached UID match is not confirmed by a live external identity. Wait for the created object or inspect Catalyst before recovering it; creation is never repeated automatically.",
+                        )
+                    },
+                )?;
+
             if collection == "servers" {
-                let actual = context.catalyst.get("servers", &id).await?
-                    .filter(|server| server["description"].as_str().unwrap_or("").lines().any(|line| line == expected_marker))
-                    .ok_or_else(|| blocked("CreateOutcomeUnknown", "The cached UID match is not confirmed by a live server identity. Wait for the created server or inspect Catalyst before recovering it; creation is never repeated automatically."))?;
                 let name = actual["name"].as_str().ok_or_else(
                     || {
                         blocked(

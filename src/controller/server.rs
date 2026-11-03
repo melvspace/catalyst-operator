@@ -1290,7 +1290,7 @@ async fn save_power_operation<K: Managed>(
     Ok(())
 }
 
-async fn power_transition<K: Managed>(
+pub(super) async fn power_transition<K: Managed>(
     object: &mut K,
     status: &mut ResourceStatus,
     context: &Context,
@@ -1300,7 +1300,7 @@ async fn power_transition<K: Managed>(
     if let Some(op) = status.operation.clone() {
         let target = match op.kind.as_str() {
             "Start" => "running",
-            "Stop" | "RestartStop" => "stopped",
+            "Stop" | "RestartStop" | "DeleteStop" => "stopped",
             _ => {
                 return Err(
                     blocked(
@@ -1495,7 +1495,7 @@ pub(super) async fn power<K: Managed>(
     )
 }
 
-async fn power_request<K: Managed>(
+pub(super) async fn power_request<K: Managed>(
     object: &mut K,
     status: &mut ResourceStatus,
     context: &Context,
