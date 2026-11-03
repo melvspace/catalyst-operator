@@ -65,6 +65,7 @@ pub struct Context {
     pub leader: Arc<crate::runtime::Leadership>,
     pub max_recovery: u32,
     pub operation_timeout: i64,
+    pub server_names: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -568,6 +569,13 @@ async fn create<K: Managed>(
     body: &Value,
     runtime: bool,
 ) -> Result<String, Error> {
+    let _name_lock = if collection == "servers" {
+        Some(context.server_names.lock().await)
+    } else {
+        None
+    };
+
+    ensure_leader(context)?;
     let kind = if runtime {
         "CreateRuntimeTemplate"
     } else {

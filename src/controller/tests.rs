@@ -26,6 +26,77 @@ impl Respond for StatusApi {
     }
 }
 
+#[derive(Clone)]
+struct NameCatalog(Arc<Mutex<Vec<Value>>>);
+
+impl Respond for NameCatalog {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let mut rows = self.0.lock().unwrap();
+
+        if request.method == "GET" {
+            // Capture the catalog before delaying, exposing overlapping checks.
+            return ResponseTemplate::new(200)
+                .set_body_json(json!({"data": rows.clone()}))
+                .set_delay(Duration::from_millis(30));
+        }
+
+        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
+
+        if request.method == "POST" {
+            body["id"] = json!(
+                format!(
+                    "new-{}",
+                    rows.len()
+                )
+            );
+            rows.push(body.clone());
+        } else {
+            let id = request
+                .url
+                .path()
+                .rsplit('/')
+                .next()
+                .unwrap();
+            let actual = rows
+                .iter_mut()
+                .find(|row| row["id"] == id)
+                .unwrap();
+            actual
+                .as_object_mut()
+                .unwrap()
+                .extend(body.as_object().unwrap().clone());
+            body = actual.clone();
+        }
+
+        ResponseTemplate::new(200).set_body_json(json!({"data": body}))
+    }
+}
+
+async fn name_catalog(server: &MockServer, rows: Vec<Value>) -> NameCatalog {
+    use wiremock::matchers::path_regex;
+
+    let catalog = NameCatalog(Arc::new(Mutex::new(rows)));
+    Mock::given(path_regex("^/servers(?:/[^/]+)?$"))
+        .respond_with(catalog.clone())
+        .mount(server)
+        .await;
+
+    catalog
+}
+
+fn one_name_claim<T, U>(left: Result<T, Error>, right: Result<U, Error>) {
+    assert_ne!(
+        left.is_ok(),
+        right.is_ok()
+    );
+    let error = left.err().or(right.err()).unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("NameConflict")
+    );
+}
+
 fn server_object() -> Server {
     serde_json::from_value(json!({"apiVersion": "catalyst.catalystctl.io/v1alpha1", "kind": "Server", "metadata": {
         "name": "game", "namespace": "games", "uid": "uid-123", "resourceVersion": "1", "generation": 1,
@@ -84,6 +155,7 @@ async fn fixture_for<K: Managed>(
         poll: Duration::from_secs(30),
         max_recovery: 5,
         operation_timeout: 900,
+        server_names: tokio::sync::Mutex::new(()),
     };
 
     (
@@ -441,6 +513,128 @@ async fn existing_name_is_not_adopted() {
             .contains("NameConflict")
     );
     assert!(status.operation.is_none());
+}
+
+#[tokio::test]
+async fn concurrent_creates_across_namespaces_allow_one_name_claim() {
+    let (kube, catalyst, context, mut first) = fixture().await;
+    let catalog = name_catalog(
+        &catalyst,
+        Vec::new(),
+    )
+    .await;
+    let mut second = first.clone();
+    second.metadata.namespace = Some("other-games".into());
+    second.metadata.uid = Some("another-uid".into());
+    Mock::given(method("PATCH"))
+        .and(path("/apis/catalyst.catalystctl.io/v1alpha1/namespaces/other-games/servers/game/status"))
+        .respond_with(StatusApi(Arc::new(Mutex::new(serde_json::to_value(&second).unwrap()))))
+        .mount(&kube).await;
+    let mut first_status = ResourceStatus::default();
+    let mut second_status = ResourceStatus::default();
+    let first_body =
+        json!({"name": "claimed", "description": marker(&first, "")});
+    let second_body =
+        json!({"name": "claimed", "description": marker(&second, "")});
+    let (left, right) = tokio::join!(
+        create(
+            &mut first,
+            &mut first_status,
+            &context,
+            "servers",
+            &first_body,
+            false
+        ),
+        create(
+            &mut second,
+            &mut second_status,
+            &context,
+            "servers",
+            &second_body,
+            false
+        ),
+    );
+    one_name_claim(
+        left, right,
+    );
+    assert_eq!(
+        catalog.0.lock().unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_renames_allow_one_name_claim() {
+    let (_kube, catalyst, context, _object) = fixture().await;
+    let catalog = name_catalog(
+        &catalyst,
+        vec![
+            json!({"id": "first", "name": "before-first"}),
+            json!({"id": "second", "name": "before-second"}),
+        ],
+    )
+    .await;
+    let updates = json!({"name": "claimed"});
+    let (left, right) = tokio::join!(
+        super::server::update_server(
+            &context, "first", &updates
+        ),
+        super::server::update_server(
+            &context, "second", &updates
+        ),
+    );
+    one_name_claim(
+        left, right,
+    );
+    assert_eq!(
+        catalog
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row["name"] == "claimed")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_create_and_rename_allow_one_name_claim() {
+    let (_kube, catalyst, context, mut object) = fixture().await;
+    let catalog = name_catalog(
+        &catalyst,
+        vec![json!({"id": "existing", "name": "before"})],
+    )
+    .await;
+    let body = json!({"name": "claimed", "description": marker(&object, "")});
+    let updates = json!({"name": "claimed"});
+    let mut status = ResourceStatus::default();
+    let (left, right) = tokio::join!(
+        create(
+            &mut object,
+            &mut status,
+            &context,
+            "servers",
+            &body,
+            false
+        ),
+        super::server::update_server(
+            &context, "existing", &updates
+        ),
+    );
+    one_name_claim(
+        left, right,
+    );
+    assert_eq!(
+        catalog
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row["name"] == "claimed")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -954,6 +1148,54 @@ async fn allocation_removal_keeps_the_applied_reference_and_reports_guidance() {
             .unwrap()
             .iter()
             .any(|request| request.method == "PUT")
+    );
+}
+
+#[tokio::test]
+async fn allocation_removal_recovers_assignment_after_lost_status_write() {
+    let mut fixture = server_fixture("stopped").await;
+    let persisted = fixture.status.clone();
+    fixture.object.spec.allocation_id = Some("assigned".into());
+    *fixture
+        .backend
+        .allocations
+        .lock()
+        .unwrap() = vec![
+        json!({"id": "assigned", "serverId": null, "ip": "192.0.2.2", "port": 25565}),
+    ];
+    fixture.reconcile().await.unwrap();
+    assert_eq!(
+        fixture
+            .backend
+            .allocations
+            .lock()
+            .unwrap()[0]["serverId"],
+        "id"
+    );
+
+    // Catalyst committed the assignment, but Kubernetes retained the old status.
+    fixture.object.status = Some(persisted);
+    fixture.object.spec.allocation_id = None;
+    fixture.kube_object.lock().unwrap()["spec"] =
+        serde_json::to_value(&fixture.object.spec).unwrap();
+    let observed = fixture.kube_object.clone();
+    reconcile(
+        Arc::new(fixture.object),
+        Arc::new(fixture.context),
+    )
+    .await
+    .unwrap();
+    let status: ResourceStatus =
+        serde_json::from_value(observed.lock().unwrap()["status"].clone())
+            .unwrap();
+    assert_eq!(
+        status.allocation_id.as_deref(),
+        Some("assigned")
+    );
+    assert!(!status.ready());
+    assert_eq!(
+        status.conditions[0].reason,
+        "AllocationRemovalUnsupported"
     );
 }
 

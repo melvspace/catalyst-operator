@@ -234,6 +234,47 @@ async fn environment(
     Ok(result)
 }
 
+pub(super) async fn update_server(
+    context: &Context,
+    id: &str,
+    updates: &Value,
+) -> Result<(), Error> {
+    let _name_lock = if let Some(name) = updates.get("name") {
+        let guard = context.server_names.lock().await;
+
+        if context
+            .catalyst
+            .list("servers")
+            .await?
+            .iter()
+            .any(|server| server["id"] != id && server["name"] == *name)
+        {
+            return Err(
+                blocked(
+                    "NameConflict",
+                    "Another Catalyst server already uses the requested name; choose another spec.name",
+                ),
+            );
+        }
+
+        Some(guard)
+    } else {
+        None
+    };
+
+    ensure_leader(context)?;
+    context
+        .catalyst
+        .request(
+            Method::PUT,
+            &format!("servers/{id}"),
+            Some(updates),
+        )
+        .await?;
+
+    Ok(())
+}
+
 async fn selected_allocation(
     context: &Context,
     spec: &ServerSpec,
@@ -290,18 +331,6 @@ pub(super) async fn server<K: Managed>(
             blocked(
                 "InvalidNetwork",
                 "Bridge networking does not support primaryIp. Remove it and select an allocationId to bind an address.",
-            ),
-        );
-    }
-
-    if status.external_id.is_some()
-        && status.allocation_id.is_some()
-        && spec.allocation_id.is_none()
-    {
-        return Err(
-            blocked(
-                "AllocationRemovalUnsupported",
-                "Catalyst cannot release an allocation through server updates. Restore spec.allocationId, select another allocation, or migrate to a separate Server without an allocation.",
             ),
         );
     }
@@ -594,6 +623,57 @@ pub(super) async fn server<K: Managed>(
         );
     }
 
+    if spec.allocation_id.is_none() {
+        // Recover ownership even if the assignment's status write was lost.
+        if let Some(ip) = actual["primaryIp"].as_str() {
+            let port = actual["primaryPort"]
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .ok_or_else(
+                    || {
+                        blocked(
+                            "InvalidResponse",
+                            "Catalyst server has an invalid primary port",
+                        )
+                    },
+                )?;
+
+            if let Some(assigned) = context
+                .catalyst
+                .assigned_allocation(
+                    &spec.node_id,
+                    &id,
+                    ip,
+                    port,
+                )
+                .await?
+            {
+                status.allocation_id = Some(
+                    assigned["id"]
+                        .as_str()
+                        .ok_or_else(
+                            || {
+                                blocked(
+                                    "InvalidResponse",
+                                    "Catalyst allocation has no ID",
+                                )
+                            },
+                        )?
+                        .to_owned(),
+                );
+            }
+        }
+
+        if status.allocation_id.is_some() {
+            return Err(
+                blocked(
+                    "AllocationRemovalUnsupported",
+                    "Catalyst cannot release an allocation through server updates. Restore spec.allocationId, select another allocation, or migrate to a separate Server without an allocation.",
+                ),
+            );
+        }
+    }
+
     let allocation_changed = if let Some(allocation) = &allocation {
         if allocation["serverId"]
             .as_str()
@@ -653,22 +733,6 @@ pub(super) async fn server<K: Managed>(
 
     if allocation_changed {
         updates["allocationId"] = json!(spec.allocation_id);
-    }
-
-    if updates.get("name").is_some()
-        && context
-            .catalyst
-            .list("servers")
-            .await?
-            .iter()
-            .any(|server| server["id"] != id && server["name"] == body["name"])
-    {
-        return Err(
-            blocked(
-                "NameConflict",
-                "Another Catalyst server already uses the requested name; choose another spec.name",
-            ),
-        );
     }
 
     if status.installed
@@ -748,15 +812,10 @@ pub(super) async fn server<K: Managed>(
     }
 
     if !updates.as_object().unwrap().is_empty() {
-        ensure_leader(context)?;
-        context
-            .catalyst
-            .request(
-                Method::PUT,
-                &format!("servers/{id}"),
-                Some(&updates),
-            )
-            .await?;
+        update_server(
+            context, &id, &updates,
+        )
+        .await?;
     }
 
     status.allocation_id = spec.allocation_id.clone();

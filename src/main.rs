@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
             operation_timeout: env::var("OPERATION_TIMEOUT_SECONDS")
                 .unwrap_or_else(|_| "900".into())
                 .parse()?,
+            server_names: tokio::sync::Mutex::new(()),
         },
     );
     let ready = leader.clone();

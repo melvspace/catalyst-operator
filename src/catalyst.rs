@@ -213,14 +213,69 @@ impl Catalyst {
         node_id: &str,
         allocation_id: &str,
     ) -> Result<Option<Value>, ApiError> {
+        self.find_allocation(
+            node_id,
+            None,
+            |row| row["id"] == allocation_id,
+        )
+        .await
+    }
+
+    pub async fn assigned_allocation(
+        &self,
+        node_id: &str,
+        server_id: &str,
+        primary_ip: &str,
+        primary_port: u16,
+    ) -> Result<Option<Value>, ApiError> {
+        self.find_allocation(
+            node_id,
+            Some(server_id),
+            |row| {
+                row["serverId"] == server_id
+                    && row["ip"] == primary_ip
+                    && row["port"] == primary_port
+            },
+        )
+        .await
+    }
+
+    async fn find_allocation(
+        &self,
+        node_id: &str,
+        server_id: Option<&str>,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Result<Option<Value>, ApiError> {
         let collection = format!("nodes/{node_id}/allocations");
         let mut page = 1;
 
         loop {
+            let mut url = self
+                .base
+                .join(&collection)
+                .expect("validated API path");
+            url.query_pairs_mut()
+                .append_pair(
+                    "limit", "100",
+                )
+                .append_pair(
+                    "page",
+                    &page.to_string(),
+                );
+
+            if let Some(server_id) = server_id {
+                url.query_pairs_mut().append_pair(
+                    "serverId", server_id,
+                );
+            }
+
             let response = self
                 .request(
                     Method::GET,
-                    &format!("{collection}?limit=100&page={page}"),
+                    &format!(
+                        "{collection}?{}",
+                        url.query().unwrap()
+                    ),
                     None,
                 )
                 .await?;
@@ -233,10 +288,7 @@ impl Catalyst {
                 },
             )?;
 
-            if let Some(allocation) = rows
-                .iter()
-                .find(|value| value["id"] == allocation_id)
-            {
+            if let Some(allocation) = rows.iter().find(|value| matches(value)) {
                 return Ok(Some(allocation.clone()));
             }
 

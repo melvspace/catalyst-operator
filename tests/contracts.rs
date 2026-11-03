@@ -166,6 +166,44 @@ async fn allocation_lookup_uses_page_pagination() {
 }
 
 #[tokio::test]
+async fn assigned_allocation_lookup_filters_owner_and_primary_binding() {
+    use wiremock::matchers::query_param;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nodes/node/allocations"))
+        .and(query_param("serverId", "owner"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [
+            {"id": "foreign", "serverId": "another", "ip": "192.0.2.1", "port": 25565},
+            {"id": "secondary", "serverId": "owner", "ip": "192.0.2.1", "port": 25566},
+            {"id": "another-ip", "serverId": "owner", "ip": "192.0.2.2", "port": 25565},
+            {"id": "primary", "serverId": "owner", "ip": "192.0.2.1", "port": 25565}
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = Catalyst::new(
+        &server.uri(),
+        "test".into(),
+    )
+    .unwrap();
+    let allocation = client
+        .assigned_allocation(
+            "node",
+            "owner",
+            "192.0.2.1",
+            25565,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        allocation["id"],
+        "primary"
+    );
+}
+
+#[tokio::test]
 async fn api_errors_never_echo_secret_values() {
     let server = MockServer::start().await;
     Mock::given(method("PUT")).and(path("/api/servers/id"))

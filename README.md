@@ -6,6 +6,8 @@ A Rust / kube-rs Kubernetes operator for declarative [Catalyst](https://github.c
 
 The namespaced `Nest`, `Template`, and `Server` resources use `catalyst.catalystctl.io/v1alpha1`. References stay within a namespace, and dependencies reconcile in order. Catalyst names default to `metadata.name`; `spec.name` overrides them. Existing Catalyst objects are never adopted automatically.
 
+Server name claims are serialized within the active operator. Catalyst does not enforce unique server names, so coordinate external writers that create or rename servers.
+
 ## Build and install
 
 Build and publish the image to a registry your cluster can access:
