@@ -1,5 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "separate-pull-requests": true,
   "packages": {
     ".": {
       "release-type": "rust",
@@ -15,6 +16,12 @@
           "path": "charts/catalyst-operator/values.yaml"
         }
       ]
+    },
+    "charts/catalyst-operator": {
+      "release-type": "helm",
+      "component": "helm",
+      "include-component-in-tag": true,
+      "bump-minor-pre-major": true
     }
   }
 }
