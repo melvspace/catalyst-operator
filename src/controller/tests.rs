@@ -1056,6 +1056,22 @@ struct ServerFixture {
 }
 
 impl ServerFixture {
+    async fn reconcile_persisted(&mut self) {
+        self.object.status = Some(self.status.clone());
+        self.kube_object.lock().unwrap()["spec"] =
+            serde_json::to_value(&self.object.spec).unwrap();
+        reconcile(
+            Arc::new(self.object.clone()),
+            Arc::new(restarted(&self.context)),
+        )
+        .await
+        .unwrap();
+        self.object =
+            serde_json::from_value(self.kube_object.lock().unwrap().clone())
+                .unwrap();
+        self.status = self.object.status();
+    }
+
     async fn reconcile(&mut self) -> Result<Action, Error> {
         let spec = self.object.spec.clone();
         self.kube_object.lock().unwrap()["spec"] =
@@ -1691,6 +1707,434 @@ async fn start_completion_does_not_claim_configuration_changed_mid_start() {
     assert_eq!(
         status.conditions[0].reason,
         "RestartRequired"
+    );
+}
+
+fn timed_out_power(
+    fixture: &mut ServerFixture,
+    kind: &str,
+    state: &str,
+) -> String {
+    fixture.backend.actual.lock().unwrap()["status"] = json!(state);
+    fixture.object.spec.power_state = if kind == "Stop" {
+        PowerState::Stopped
+    } else {
+        PowerState::Running
+    };
+
+    if kind == "RestartStop" {
+        fixture.object.spec.restart_token = "restart-request".into();
+    }
+
+    let started = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    fixture.status.operation = Some(
+        Operation {
+            started_at: started.clone(),
+            accepted: true,
+            retry_token: Some(fixture.object.spec.retry_token.clone()),
+            ..operation(kind)
+        },
+    );
+    fixture.status.last_power_attempt_at = Some(started.clone());
+    fixture
+        .status
+        .operation_configuration_digest = fixture
+        .status
+        .configuration_digest
+        .clone();
+    fixture.status.operation_restart_token = Some(
+        fixture
+            .object
+            .spec
+            .restart_token
+            .clone(),
+    );
+    fixture.status.recovery_attempts = 5;
+
+    started
+}
+
+#[tokio::test]
+async fn expired_power_transitions_keep_recovery_status_after_restart() {
+    for (kind, state) in [
+        (
+            "Start", "starting",
+        ),
+        (
+            "Stop", "stopping",
+        ),
+        (
+            "RestartStop",
+            "stopping",
+        ),
+    ] {
+        for attempts in [1, 5] {
+            let mut fixture = server_fixture("running").await;
+            let started = timed_out_power(
+                &mut fixture,
+                kind,
+                state,
+            );
+            // Journals from older versions have no recovery-token baseline.
+            fixture
+                .status
+                .operation
+                .as_mut()
+                .unwrap()
+                .retry_token = None;
+            fixture.status.recovery_attempts = attempts;
+
+            for _ in 0..3 {
+                fixture.reconcile_persisted().await;
+                assert_eq!(
+                    fixture.status.conditions[0].reason,
+                    "RecoveryRequired"
+                );
+                assert!(!fixture.status.ready());
+                assert!(
+                    fixture.status.conditions.iter().any(
+                        |condition| condition.type_ == "Stalled"
+                            && condition.status == "True"
+                    )
+                );
+                let pending = fixture
+                    .status
+                    .operation
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(
+                    pending.kind,
+                    kind
+                );
+                assert_eq!(
+                    pending.started_at,
+                    started
+                );
+                let guidance = fixture
+                    .status
+                    .recovery_action
+                    .as_deref()
+                    .unwrap();
+                assert!(
+                    guidance.contains(kind)
+                        && guidance.contains(state)
+                        && guidance.contains("retryToken")
+                );
+                assert_eq!(
+                    fixture.status.recovery_attempts,
+                    attempts
+                );
+            }
+
+            assert!(
+                !fixture
+                    .catalyst
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.method == "POST")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn timed_out_power_completes_when_the_requested_state_arrives() {
+    for (kind, pending, reached) in [
+        (
+            "Start", "starting", "running",
+        ),
+        (
+            "Stop", "stopping", "stopped",
+        ),
+    ] {
+        let mut fixture = server_fixture("running").await;
+        timed_out_power(
+            &mut fixture,
+            kind,
+            pending,
+        );
+        fixture.reconcile_persisted().await;
+        assert_eq!(
+            fixture.status.conditions[0].reason,
+            "RecoveryRequired"
+        );
+        fixture.backend.actual.lock().unwrap()["status"] = json!(reached);
+        fixture.reconcile_persisted().await;
+        assert!(fixture.status.ready());
+        assert!(fixture.status.operation.is_none());
+        assert!(fixture.status.recovery_action.is_none());
+        assert!(
+            fixture
+                .status
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("RecoveryRequired")
+        );
+        assert!(
+            !fixture
+                .catalyst
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method == "POST")
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolved_restart_stop_still_obeys_the_start_budget() {
+    let mut fixture = server_fixture("running").await;
+    timed_out_power(
+        &mut fixture,
+        "RestartStop",
+        "stopping",
+    );
+    fixture.reconcile_persisted().await;
+    fixture.backend.actual.lock().unwrap()["status"] = json!("stopped");
+    fixture.reconcile_persisted().await;
+    assert!(fixture.status.operation.is_none());
+    assert_eq!(
+        fixture.status.conditions[0].reason,
+        "RecoveryRequired"
+    );
+    assert_eq!(
+        fixture.status.recovery_attempts,
+        5
+    );
+    fixture.object.spec.retry_token = "resume".into();
+    fixture.reconcile_persisted().await;
+    fixture.reconcile_persisted().await;
+    assert!(fixture.status.ready());
+    assert_eq!(
+        fixture.status.recovery_attempts,
+        1
+    );
+    assert_eq!(
+        fixture
+            .catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn timeout_retry_requires_a_fresh_token_after_external_resolution() {
+    for (kind, pending, cancelled) in [
+        (
+            "Start", "starting", "stopped",
+        ),
+        (
+            "Stop", "stopping", "running",
+        ),
+    ] {
+        let mut fixture = server_fixture("running").await;
+        let started = timed_out_power(
+            &mut fixture,
+            kind,
+            pending,
+        );
+        fixture.reconcile_persisted().await;
+        fixture.object.spec.retry_token = "early".into();
+        fixture.reconcile_persisted().await;
+        assert_eq!(
+            fixture
+                .status
+                .operation
+                .as_ref()
+                .unwrap()
+                .retry_token
+                .as_deref(),
+            Some("early")
+        );
+        fixture.backend.actual.lock().unwrap()["status"] = json!(cancelled);
+        fixture.reconcile_persisted().await;
+        assert_eq!(
+            fixture.status.conditions[0].reason,
+            "RecoveryRequired"
+        );
+        assert_eq!(
+            fixture
+                .status
+                .operation
+                .as_ref()
+                .unwrap()
+                .started_at,
+            started
+        );
+        assert!(
+            !fixture
+                .catalyst
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method == "POST")
+        );
+        fixture.object.spec.retry_token = "resolved".into();
+        fixture.reconcile_persisted().await;
+        assert_ne!(
+            fixture
+                .status
+                .operation
+                .as_ref()
+                .unwrap()
+                .started_at,
+            started
+        );
+        fixture.reconcile_persisted().await;
+        assert!(fixture.status.ready());
+        assert_eq!(
+            fixture
+                .catalyst
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn power_intent_requires_a_persisted_recovery_token() {
+    let mut fixture = server_fixture("stopped").await;
+    fixture.object.spec.power_state = PowerState::Running;
+    let status_api = StatusApi(fixture.kube_object.clone());
+    Mock::given(method("PATCH"))
+        .and(path("/apis/catalyst.catalystctl.io/v1alpha1/namespaces/games/servers/game/status"))
+        .respond_with(move |request: &Request| {
+            let mut request = request.clone();
+            let mut body: Value = serde_json::from_slice(&request.body).unwrap();
+
+            if let Some(operation) = body["status"]["operation"].as_object_mut() {
+                operation.remove("retryToken");
+            }
+
+            request.body = serde_json::to_vec(&body).unwrap();
+
+            status_api.respond(&request)
+        }).with_priority(1).mount(&fixture._kube).await;
+    fixture.reconcile_persisted().await;
+    assert_eq!(
+        fixture.status.conditions[0].reason,
+        "SchemaUpgradeRequired"
+    );
+    assert!(fixture.status.operation.is_none());
+    assert!(
+        !fixture
+            .catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.method == "POST")
+    );
+}
+
+#[tokio::test]
+async fn definitive_power_rejections_clear_intent_and_allow_bounded_retry() {
+    for (state, desired, endpoint) in [
+        (
+            "stopped",
+            PowerState::Running,
+            "start",
+        ),
+        (
+            "running",
+            PowerState::Stopped,
+            "stop",
+        ),
+    ] {
+        let mut fixture = server_fixture(state).await;
+        fixture.object.spec.power_state = desired;
+        Mock::given(method("POST"))
+            .and(path(format!("/servers/id/{endpoint}")))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"code": "PERMISSION_DENIED"})),
+            )
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&fixture.catalyst)
+            .await;
+        fixture.reconcile_persisted().await;
+        assert_eq!(
+            fixture.status.conditions[0].reason,
+            "CatalystApiError"
+        );
+        assert!(fixture.status.operation.is_none());
+        fixture.status.last_power_attempt_at = None;
+        fixture.reconcile_persisted().await;
+        fixture.reconcile_persisted().await;
+        assert!(fixture.status.ready());
+        assert_eq!(
+            fixture
+                .catalyst
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_power_response_keeps_intent_without_repeating_request() {
+    let mut fixture = server_fixture("stopped").await;
+    fixture.object.spec.power_state = PowerState::Running;
+    Mock::given(method("POST"))
+        .and(path("/servers/id/start"))
+        .respond_with(
+            ResponseTemplate::new(504)
+                .set_body_json(json!({"code": "GATEWAY_TIMEOUT"})),
+        )
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&fixture.catalyst)
+        .await;
+    fixture.reconcile_persisted().await;
+    fixture.reconcile_persisted().await;
+    assert_eq!(
+        fixture
+            .status
+            .operation
+            .as_ref()
+            .unwrap()
+            .kind,
+        "Start"
+    );
+    assert!(
+        !fixture
+            .status
+            .operation
+            .as_ref()
+            .unwrap()
+            .accepted
+    );
+    assert_eq!(
+        fixture
+            .catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        1
     );
 }
 

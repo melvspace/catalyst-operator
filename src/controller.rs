@@ -340,6 +340,7 @@ fn operation(kind: &str) -> Operation {
         started_at: Utc::now().to_rfc3339(),
         accepted: false,
         observed_active: false,
+        retry_token: None,
     }
 }
 

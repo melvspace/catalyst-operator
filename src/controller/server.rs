@@ -847,8 +847,9 @@ pub(super) async fn server<K: Managed>(
 
     if status.installed
         && let Some(action) = power_transition(
-            object, status, context, state,
-        )?
+            object, status, context, spec, state,
+        )
+        .await?
     {
         return Ok(action);
     }
@@ -1174,16 +1175,39 @@ fn observe_running(status: &mut ResourceStatus, state: &str) {
     }
 }
 
-fn power_transition<K: Managed>(
+async fn save_power_operation<K: Managed>(
+    object: &mut K,
+    status: &ResourceStatus,
+    context: &Context,
+) -> Result<(), Error> {
+    save(
+        object, status, context,
+    )
+    .await?;
+
+    if object.status().operation != status.operation {
+        return Err(
+            blocked(
+                "SchemaUpgradeRequired",
+                "Kubernetes did not preserve the power operation and its recovery token. Apply the current operator CRDs before continuing.",
+            ),
+        );
+    }
+
+    Ok(())
+}
+
+async fn power_transition<K: Managed>(
     object: &mut K,
     status: &mut ResourceStatus,
     context: &Context,
+    spec: &ServerSpec,
     state: &str,
 ) -> Result<Option<Action>, Error> {
     if let Some(op) = status.operation.clone() {
-        let reached = match op.kind.as_str() {
-            "Start" => state == "running",
-            "Stop" | "RestartStop" => state == "stopped",
+        let target = match op.kind.as_str() {
+            "Start" => "running",
+            "Stop" | "RestartStop" => "stopped",
             _ => {
                 return Err(
                     blocked(
@@ -1194,7 +1218,7 @@ fn power_transition<K: Managed>(
             }
         };
 
-        if reached {
+        if state == target {
             status.operation = None;
 
             if op.kind == "Start" {
@@ -1206,13 +1230,49 @@ fn power_transition<K: Managed>(
                     .take()
                     .unwrap_or_default();
             }
-        } else if expired(
-            &op,
-            context.operation_timeout,
-        ) || ["error", "crashed"].contains(&state)
-        {
+        } else if ["error", "crashed"].contains(&state) {
             status.operation = None;
         } else {
+            let timed_out = expired(
+                &op,
+                context.operation_timeout,
+            );
+            let stable = ["running", "stopped"].contains(&state);
+            let retry_requested = op
+                .retry_token
+                .as_deref()
+                .is_some_and(|token| token != spec.retry_token);
+
+            if timed_out && stable && retry_requested {
+                status.operation = None;
+
+                return Ok(None);
+            }
+
+            if op.retry_token.as_deref() != Some(spec.retry_token.as_str()) {
+                status
+                    .operation
+                    .as_mut()
+                    .unwrap()
+                    .retry_token = Some(spec.retry_token.clone());
+                save_power_operation(
+                    object, status, context,
+                )
+                .await?;
+            }
+
+            if timed_out {
+                return Err(
+                    blocked(
+                        "RecoveryRequired",
+                        format!(
+                            "Catalyst {} requested at {} did not reach {target}; current state is {state}. Inspect Catalyst/node logs and resolve or cancel the external operation. Reaching {target} completes it automatically. For another attempt, wait for running or stopped, then change spec.retryToken. Tokens changed during an unresolved transition do not queue another request.",
+                            op.kind, op.started_at,
+                        ),
+                    ),
+                );
+            }
+
             condition(
                 object,
                 status,
@@ -1243,8 +1303,10 @@ pub(super) async fn power<K: Managed>(
     );
 
     if let Some(action) = power_transition(
-        object, status, context, state,
-    )? {
+        object, status, context, spec, state,
+    )
+    .await?
+    {
         return Ok(action);
     }
 
@@ -1380,7 +1442,13 @@ async fn power_request<K: Managed>(
         }
     }
 
+    let previous = status.clone();
     status.operation = Some(operation(kind));
+    status
+        .operation
+        .as_mut()
+        .unwrap()
+        .retry_token = Some(spec.retry_token.clone());
     status.operation_configuration_digest = Some(desired_digest.into());
     status.operation_restart_token = Some(spec.restart_token.clone());
     status.last_power_attempt_at = Some(Utc::now().to_rfc3339());
@@ -1398,19 +1466,36 @@ async fn power_request<K: Managed>(
         "Power operation intent persisted; waiting for Catalyst",
         false,
     );
-    save(
+    if let Err(error) = save_power_operation(
         object, status, context,
     )
-    .await?;
+    .await
+    {
+        *status = previous;
+
+        return Err(error);
+    }
+
     ensure_leader(context)?;
-    context
+    let response = context
         .catalyst
         .request(
             Method::POST,
             &format!("servers/{id}/{endpoint}"),
             Some(&json!({})),
         )
-        .await?;
+        .await;
+
+    if let Err(error) = response {
+        if !error.ambiguous() {
+            status.operation = None;
+            status.operation_configuration_digest = None;
+            status.operation_restart_token = None;
+        }
+
+        return Err(error.into());
+    }
+
     status
         .operation
         .as_mut()

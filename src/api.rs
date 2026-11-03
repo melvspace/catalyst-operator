@@ -215,6 +215,8 @@ pub struct Operation {
     pub accepted: bool,
     #[serde(default)]
     pub observed_active: bool,
+    #[serde(default)]
+    pub retry_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]

@@ -137,6 +137,8 @@ Environment and startup changes update Catalyst configuration but leave a runnin
 
 Starts use bounded retries with backoff. Five minutes of stable running resets the failure budget. Once `RecoveryRequired` appears, resolve the failure and change `spec.retryToken`. The default budget is five attempts.
 
+Timed-out power transitions retain their operation and original timestamp with `RecoveryRequired`, including when Catalyst remains `starting` or `stopping`. Inspect Catalyst/node logs and resolve or cancel the external operation. Reaching the requested state completes it automatically. If cancellation leaves the server `running` or `stopped`, change `retryToken` after that state is stable to authorize recovery. Tokens changed while the transition is unresolved do not queue another command.
+
 Installation completion requires an observed `installing` → `stopped`/`running` transition. Catalyst has no durable installed flag, so a fast installation or lost response can produce `InstallationUnconfirmed`. Inspect Catalyst logs and node files; if installation completed, change `spec.installationConfirmationToken`. Failed installation is resolved manually in Catalyst. The operator never calls reinstall or automatically repeats an ambiguous install.
 
 If a managed server disappears, `Missing` blocks automatic recreation. After deciding how to recover its data, change `spec.replacementToken` to authorize creation of a fresh server. Replacement does not recover old data.
