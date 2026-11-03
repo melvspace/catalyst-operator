@@ -63,6 +63,14 @@ pub(super) async fn cleanup<K: Managed>(
         );
     }
 
+    if let Some(action) = observe_pending_operation(
+        object, status, context,
+    )
+    .await?
+    {
+        return Ok(action);
+    }
+
     if object.model().deletion_policy() == &DeletionPolicy::Retain {
         if K::COLLECTION == "servers" {
             names::retain(
@@ -112,25 +120,6 @@ pub(super) async fn cleanup<K: Managed>(
                     ),
                 );
             }
-
-            if let Some(id) = &status.external_id {
-                let templates = context
-                    .catalyst
-                    .list("templates")
-                    .await?;
-
-                if templates
-                    .iter()
-                    .any(|v| v["nestId"] == *id)
-                {
-                    return Err(
-                        blocked(
-                            "DeletionBlocked",
-                            "Catalyst templates still reference this nest, including retained or unmanaged templates",
-                        ),
-                    );
-                }
-            }
         }
         Model::Template(_) => {
             let children = Api::<Server>::namespaced(
@@ -170,6 +159,44 @@ pub(super) async fn cleanup<K: Managed>(
             )
             .await?
     {
+        if K::COLLECTION == "nests" {
+            let templates = actual["templates"]
+                .as_array()
+                .ok_or_else(
+                    || {
+                        blocked(
+                            "InvalidResponse",
+                            "Catalyst nest detail is missing its template dependency list; deletion is blocked until the live dependencies can be verified",
+                        )
+                    },
+                )?;
+
+            if !templates.is_empty() {
+                let ids: Vec<_> = templates
+                    .iter()
+                    .take(10)
+                    .map(
+                        |template| {
+                            template["id"]
+                                .as_str()
+                                .unwrap_or("unknown")
+                        },
+                    )
+                    .collect();
+
+                return Err(
+                    blocked(
+                        "DeletionBlocked",
+                        format!(
+                            "Catalyst nest has {} dependent templates, including retained or unmanaged templates (first IDs: {}). Delete or detach them first; inspect Catalyst for the complete dependency list.",
+                            templates.len(),
+                            ids.join(", "),
+                        ),
+                    ),
+                );
+            }
+        }
+
         if let Model::Server(spec) = object.model() {
             let state = actual["status"]
                 .as_str()
@@ -180,30 +207,6 @@ pub(super) async fn cleanup<K: Managed>(
                 status,
                 context.poll,
             );
-
-            if status
-                .operation
-                .as_ref()
-                .is_some_and(|op| op.kind == "Install")
-            {
-                return server::install(
-                    object, status, context, &spec, &id, state,
-                )
-                .await;
-            }
-
-            if status.operation.as_ref().is_some_and(
-                |op| {
-                    ["Start", "Stop", "RestartStop", "DeleteStop"]
-                        .contains(&op.kind.as_str())
-                },
-            ) && let Some(action) = server::power_transition(
-                object, status, context, &spec, state,
-            )
-            .await?
-            {
-                return Ok(action);
-            }
 
             if state == "installing" {
                 return Err(
@@ -326,6 +329,87 @@ pub(super) async fn cleanup<K: Managed>(
         object, context,
     )
     .await
+}
+
+async fn observe_pending_operation<K: Managed>(
+    object: &mut K,
+    status: &mut ResourceStatus,
+    context: &Context,
+) -> Result<Option<Action>, Error> {
+    let Some(op) = status.operation.clone() else {
+        return Ok(None);
+    };
+    let Model::Server(spec) = object.model() else {
+        return Err(
+            blocked(
+                "RecoveryRequired",
+                "An unresolved operation blocks finalizer release; inspect status.operation before resolving it manually",
+            ),
+        );
+    };
+
+    if !["Install", "Start", "Stop", "RestartStop", "DeleteStop"]
+        .contains(&op.kind.as_str())
+    {
+        return Err(
+            blocked(
+                "RecoveryRequired",
+                "Unknown pending operation; inspect status.operation before resolving it manually",
+            ),
+        );
+    }
+
+    let id = status.external_id.clone().ok_or_else(
+        || {
+            blocked(
+                "RecoveryRequired",
+                "A pending operation has no external server identity. Recover status.externalId before releasing the finalizer.",
+            )
+        },
+    )?;
+    let actual = context
+        .catalyst
+        .get(
+            "servers",
+            &id,
+        )
+        .await?
+        .ok_or_else(
+            || {
+                blocked(
+                    "RecoveryRequired",
+                    "Catalyst server disappeared during an unresolved operation. Inspect Catalyst/node resources and resolve the journal before releasing the finalizer.",
+                )
+            },
+        )?;
+    let state = actual["status"]
+        .as_str()
+        .unwrap_or("unknown");
+    status.external_state = Some(state.into());
+    status.endpoints = server::endpoints(&actual);
+    observed(
+        status,
+        context.poll,
+    );
+
+    if op.kind == "Install" {
+        return server::install(
+            object, status, context, &spec, &id, state,
+        )
+        .await
+        .map(Some);
+    }
+
+    let action = server::power_transition(
+        object, status, context, &spec, state,
+    )
+    .await?;
+    save(
+        object, status, context,
+    )
+    .await?;
+
+    Ok(action)
 }
 
 async fn remove_finalizer<K: Managed>(

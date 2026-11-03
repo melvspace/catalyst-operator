@@ -431,6 +431,49 @@ pub(super) async fn server<K: Managed>(
         );
     }
 
+    let primary_host_port = spec
+        .port_bindings
+        .get(&spec.primary_port.to_string())
+        .copied()
+        .unwrap_or(spec.primary_port);
+
+    if spec.allocation_id.is_some() && primary_host_port != spec.primary_port {
+        if let Some(id) = &status.external_id
+            && let Some(actual) = context
+                .catalyst
+                .get(
+                    "servers", id,
+                )
+                .await?
+        {
+            status.allocation_id = primary_allocation(
+                context,
+                &spec.node_id,
+                id,
+                &actual,
+            )
+            .await?;
+            status.endpoints = endpoints(&actual);
+            status.external_state = actual["status"]
+                .as_str()
+                .map(str::to_owned);
+            observed(
+                status,
+                context.poll,
+            );
+        }
+
+        return Err(
+            blocked(
+                "AllocationPortBindingMismatch",
+                format!(
+                    "The primary container port {port} publishes host port {primary_host_port}, but the selected allocation requires host port {port}. Remove the primary portBindings entry or map it to the allocation's port.",
+                    port = spec.primary_port,
+                ),
+            ),
+        );
+    }
+
     let mut allocation = selected_allocation(
         context, spec,
     )
@@ -810,6 +853,10 @@ pub(super) async fn server<K: Managed>(
                     "The selected allocation is already assigned but does not match the server's primary address and port. Catalyst cannot safely promote it through this API. Restore the current primary allocation, choose a free allocation, or detach the secondary in Catalyst before selecting it.",
                 ),
             );
+        }
+
+        if allocation["serverId"] == id {
+            status.allocation_id = spec.allocation_id.clone();
         }
 
         allocation["serverId"] != id

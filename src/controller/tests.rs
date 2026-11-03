@@ -2828,6 +2828,214 @@ async fn retain_preserves_all_unresolved_creation_journals_until_recovery() {
 }
 
 #[tokio::test]
+async fn retain_waits_for_power_and_install_without_dispatching_commands() {
+    for (kind, active, reached) in [
+        (
+            "Start", "starting", "running",
+        ),
+        (
+            "Stop", "stopping", "stopped",
+        ),
+        (
+            "RestartStop",
+            "stopping",
+            "stopped",
+        ),
+        (
+            "DeleteStop",
+            "stopping",
+            "stopped",
+        ),
+        (
+            "Install",
+            "installing",
+            "stopped",
+        ),
+    ] {
+        let mut fixture = deleting_server_fixture("running").await;
+        fixture.object.spec.deletion_policy = DeletionPolicy::Retain;
+        let pending = operation(kind);
+        fixture.status.operation = Some(pending.clone());
+        fixture.backend.actual.lock().unwrap()["status"] = json!(active);
+
+        for _ in 0..2 {
+            fixture.reconcile_persisted().await;
+            assert!(
+                fixture
+                    .object
+                    .finalizers()
+                    .iter()
+                    .any(|value| value == FINALIZER)
+            );
+            assert_eq!(
+                fixture
+                    .status
+                    .operation
+                    .as_ref()
+                    .unwrap()
+                    .started_at,
+                pending.started_at
+            );
+            assert!(!fixture.status.ready());
+        }
+
+        fixture.backend.actual.lock().unwrap()["status"] = json!(reached);
+        fixture.reconcile_persisted().await;
+
+        if kind == "Install" {
+            fixture.reconcile_persisted().await;
+        }
+
+        assert!(fixture.object.finalizers().is_empty());
+        assert!(fixture.status.operation.is_none());
+        assert!(
+            !fixture
+                .backend
+                .actual
+                .lock()
+                .unwrap()
+                .is_null()
+        );
+        assert!(
+            fixture
+                .catalyst
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+    }
+}
+
+#[tokio::test]
+async fn retained_ambiguous_install_requires_confirmation_before_release() {
+    let mut fixture = deleting_server_fixture("stopped").await;
+    fixture.object.spec.deletion_policy = DeletionPolicy::Retain;
+    fixture.status.operation = Some(operation("Install"));
+    fixture.reconcile_persisted().await;
+    assert_eq!(
+        fixture.status.conditions[0].reason,
+        "InstallationUnconfirmed"
+    );
+    assert!(
+        fixture
+            .object
+            .finalizers()
+            .iter()
+            .any(|value| value == FINALIZER)
+    );
+    fixture
+        .object
+        .spec
+        .installation_confirmation_token = "inspected".into();
+    fixture.reconcile_persisted().await;
+    fixture.reconcile_persisted().await;
+    assert!(fixture.object.finalizers().is_empty());
+    assert!(
+        fixture
+            .catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method == "GET")
+    );
+}
+
+#[tokio::test]
+async fn nest_deletion_requires_a_live_empty_dependency_list() {
+    let mut object: Nest = serde_json::from_value(json!({"metadata": server_object().metadata, "spec": {"deletionPolicy": "Delete"}})).unwrap();
+    object.metadata.deletion_timestamp =
+        Some(Time(k8s_openapi::jiff::Timestamp::now()));
+    object.status = Some(
+        ResourceStatus {
+            external_id: Some("nest".into()),
+            ..Default::default()
+        },
+    );
+    let (kube, catalyst, context, mut object, stored) =
+        fixture_for(object).await;
+    Mock::given(method("GET"))
+        .and(path("/apis/catalyst.catalystctl.io/v1alpha1/namespaces/games/templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"apiVersion": "catalyst.catalystctl.io/v1alpha1", "kind": "TemplateList", "metadata": {}, "items": []})))
+        .mount(&kube).await;
+    Mock::given(method("GET"))
+        .and(path("/templates"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": []})),
+        )
+        .mount(&catalyst)
+        .await;
+    let actual = Arc::new(
+        Mutex::new(
+            json!({"id": "nest", "templates": [{"id": "retained-dependent", "nestId": "nest"}]}),
+        ),
+    );
+    let live = actual.clone();
+    Mock::given(method("GET"))
+        .and(path("/nests/nest"))
+        .respond_with(
+            move |_: &Request| {
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"data": live.lock().unwrap().clone()}),
+                )
+            },
+        )
+        .mount(&catalyst)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/nests/nest"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"success": true})),
+        )
+        .mount(&catalyst)
+        .await;
+
+    for dependencies in [
+        json!([{"id": "retained-dependent"}]),
+        Value::Null,
+        json!({}),
+    ] {
+        actual.lock().unwrap()["templates"] = dependencies;
+        reconcile(
+            Arc::new(object),
+            Arc::new(restarted(&context)),
+        )
+        .await
+        .unwrap();
+        object =
+            serde_json::from_value(stored.lock().unwrap().clone()).unwrap();
+        assert!(
+            object
+                .finalizers()
+                .iter()
+                .any(|value| value == FINALIZER)
+        );
+        assert!(!object.status().ready());
+        assert!(
+            catalyst
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method != "DELETE")
+        );
+    }
+
+    actual.lock().unwrap()["templates"] = json!([]);
+    reconcile(
+        Arc::new(object),
+        Arc::new(restarted(&context)),
+    )
+    .await
+    .unwrap();
+    let object: Nest =
+        serde_json::from_value(stored.lock().unwrap().clone()).unwrap();
+    assert!(object.finalizers().is_empty());
+}
+
+#[tokio::test]
 async fn cleanup_warnings_survive_a_missing_external_record() {
     let mut object = server_object();
     object.spec.deletion_policy = DeletionPolicy::Delete;
@@ -3117,6 +3325,137 @@ async fn stopped_power_request_is_not_blocked_by_pending_resource_edits() {
     assert_eq!(
         actual["allocatedCpuCores"],
         3
+    );
+}
+
+#[tokio::test]
+async fn running_allocation_binding_drift_waits_for_authorized_repair() {
+    let mut fixture = server_fixture("running").await;
+    fixture.object.spec.allocation_id = Some("primary".into());
+    fixture.backend.allocations.lock().unwrap().push(json!({"id": "primary", "serverId": "id", "ip": "192.0.2.1", "port": 25565}));
+    fixture.backend.actual.lock().unwrap()["portBindings"]["25565"] =
+        json!(30000);
+    fixture.reconcile_persisted().await;
+    assert_eq!(
+        fixture.status.conditions[0].reason,
+        "RestartRequired"
+    );
+    assert_eq!(
+        fixture.status.allocation_id.as_deref(),
+        Some("primary")
+    );
+    assert!(
+        fixture
+            .status
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.port == 30000)
+    );
+    assert!(
+        fixture
+            .catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method == "GET")
+    );
+    fixture.object.spec.restart_token = "repair-binding".into();
+    fixture.reconcile_persisted().await;
+    fixture.status.last_power_attempt_at = None;
+    fixture.reconcile_persisted().await;
+    fixture.reconcile_persisted().await;
+    assert!(fixture.status.ready());
+    assert!(
+        fixture
+            .status
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.port == 25565)
+    );
+}
+
+#[tokio::test]
+async fn allocation_primary_binding_rejects_incompatible_creation_and_edits() {
+    let (_kube, catalyst, context, mut object) = fixture().await;
+    object.spec.allocation_id = Some("primary".into());
+    object.spec.port_bindings.insert(
+        "25565".into(),
+        30000,
+    );
+    let spec = object.spec.clone();
+    let error = server(
+        &mut object,
+        &mut ResourceStatus::default(),
+        &context,
+        &spec,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("AllocationPortBindingMismatch")
+    );
+    assert!(
+        catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut fixture = server_fixture("stopped").await;
+    fixture.object.spec.allocation_id = Some("primary".into());
+    fixture
+        .object
+        .spec
+        .port_bindings
+        .insert(
+            "25565".into(),
+            30000,
+        );
+    fixture.backend.allocations.lock().unwrap().push(json!({"id": "primary", "serverId": "id", "ip": "192.0.2.1", "port": 25565}));
+    fixture.reconcile_persisted().await;
+    assert_eq!(
+        fixture.status.conditions[0].reason,
+        "AllocationPortBindingMismatch"
+    );
+    assert!(!fixture.status.ready());
+    assert_eq!(
+        fixture.status.allocation_id.as_deref(),
+        Some("primary")
+    );
+    assert!(
+        fixture
+            .catalyst
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method != "PUT")
+    );
+
+    fixture
+        .object
+        .spec
+        .port_bindings
+        .clear();
+    fixture.backend.actual.lock().unwrap()["portBindings"]["25565"] =
+        json!(30000);
+    fixture.reconcile_persisted().await;
+    fixture.reconcile_persisted().await;
+    assert!(fixture.status.ready());
+    assert!(
+        fixture
+            .status
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.port == 25565)
+    );
+    assert_eq!(
+        fixture.status.allocation_id.as_deref(),
+        Some("primary")
     );
 }
 
